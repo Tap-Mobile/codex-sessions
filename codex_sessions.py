@@ -6,6 +6,7 @@ import curses
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -50,6 +51,7 @@ USING fts5(
 """
 
 SCHEMA_VERSION = 2
+PARSER_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,17 @@ def _extract_text_from_message_payload(payload: dict) -> str:
             if isinstance(txt, str) and txt.strip():
                 parts.append(txt)
     return "\n".join(parts).strip()
+
+def _strip_boilerplate(text: str) -> str:
+    s = text
+    s = re.sub(r"<environment_context>.*?</environment_context>", "", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"<user_instructions>.*?</user_instructions>", "", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"<instructions>.*?</instructions>", "", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"^#\s*AGENTS\.md.*$", "", s, flags=re.IGNORECASE | re.MULTILINE)
+    s = re.sub(r"\\n{3,}", "\n\n", s)
+    s = s.strip()
+    s = " ".join(s.split())
+    return s
 
 
 def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
@@ -147,8 +160,15 @@ def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
                     continue
 
                 text = _extract_text_from_message_payload(payload)
-                if text:
-                    messages.append((role, text))
+                if not text:
+                    continue
+
+                if role == "user":
+                    text = _strip_boilerplate(text)
+                    if not text:
+                        continue
+
+                messages.append((role, text))
 
     except FileNotFoundError:
         return None
@@ -167,8 +187,9 @@ def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
     title = ""
     for role, text in messages:
         if role == "user":
-            title = " ".join(text.split())
-            title = title[:120]
+            if len(text) < 8:
+                continue
+            title = text[:120]
             break
     if not title:
         title = path.name
@@ -261,6 +282,14 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
     conn = connect_db(db_path)
     changed = 0
     now = int(dt.datetime.now().timestamp())
+    force_reindex = False
+
+    with conn:
+        pv = _get_meta(conn, "parser_version")
+        current = int(pv) if pv and pv.isdigit() else 0
+        if current != PARSER_VERSION:
+            force_reindex = True
+            _set_meta(conn, "parser_version", str(PARSER_VERSION))
 
     files = sorted(iter_session_files(codex_dir))
     with conn:
@@ -275,7 +304,12 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
                 (str(p),),
             ).fetchone()
 
-            if row and int(row[0]) == int(st.st_mtime_ns) and int(row[1]) == int(st.st_size):
+            if (
+                not force_reindex
+                and row
+                and int(row[0]) == int(st.st_mtime_ns)
+                and int(row[1]) == int(st.st_size)
+            ):
                 continue
 
             doc = parse_codex_session_file(p)
@@ -446,6 +480,33 @@ def _truncate(s: str, width: int) -> str:
         return s
     return s[: max(0, width - 1)] + "…"
 
+def _format_table_row(r: SearchRow, width: int, include_snippet: bool) -> str:
+    created = _fmt_ts(r.created_at)
+    updated = _fmt_ts(r.updated_at)
+    sid = r.session_id[:8]
+
+    # Fixed columns + spaces:
+    # 16 +1 +16 +1 +8 +1 = 43, leaving remainder for title/snippet.
+    remaining = max(0, width - 1 - 43)
+    title_w = min(48, max(18, remaining // (2 if include_snippet else 1)))
+    snippet_w = max(0, remaining - title_w - (1 if include_snippet else 0))
+
+    title = _truncate(r.title or "", title_w)
+    snippet = _truncate(r.snippet or "", snippet_w) if include_snippet else ""
+    if include_snippet and snippet_w > 0:
+        return f"{created:<16} {updated:<16} {sid:<8} {title:<{title_w}} {snippet}"
+    return f"{created:<16} {updated:<16} {sid:<8} {title}"
+
+def _format_table_header(width: int, include_snippet: bool) -> tuple[str, str]:
+    remaining = max(0, width - 1 - 43)
+    title_w = min(48, max(18, remaining // (2 if include_snippet else 1)))
+    snippet_w = max(0, remaining - title_w - (1 if include_snippet else 0))
+    if include_snippet and snippet_w > 0:
+        hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID':<8} {'TITLE':<{title_w}} {'MATCH':<{snippet_w}}"
+    else:
+        hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID':<8} {'TITLE':<{title_w}}"
+    return _truncate(hdr, width - 1), _truncate("-" * (width - 1), width - 1)
+
 
 def _run_curses_picker(rows: list[SearchRow], auto_copy: bool) -> Optional[str]:
     if not rows:
@@ -477,28 +538,26 @@ def _run_curses_picker(rows: list[SearchRow], auto_copy: bool) -> Optional[str]:
                 header = header + " (copied)"
             stdscr.addstr(0, 0, _truncate(header, width - 1))
 
-            visible = height - 2
+            visible = height - 4
             if idx < offset:
                 offset = idx
             if idx >= offset + visible:
                 offset = idx - visible + 1
+
+            header, sep = _format_table_header(width, include_snippet=True)
+            stdscr.addstr(1, 0, header)
+            stdscr.addstr(2, 0, sep)
 
             for row_i in range(visible):
                 i = offset + row_i
                 if i >= len(rows):
                     break
                 r = rows[i]
-                line = (
-                    f"{_fmt_ts(r.created_at)}  "
-                    f"{_fmt_ts(r.updated_at)}  "
-                    f"{r.session_id}  "
-                    f"{r.title}  "
-                    f"{r.snippet}"
-                )
+                line = _format_table_row(r, width, include_snippet=True)
                 if i == idx:
-                    stdscr.addstr(1 + row_i, 0, _truncate(line, width - 1), curses.A_REVERSE)
+                    stdscr.addstr(3 + row_i, 0, _truncate(line, width - 1), curses.A_REVERSE)
                 else:
-                    stdscr.addstr(1 + row_i, 0, _truncate(line, width - 1))
+                    stdscr.addstr(3 + row_i, 0, _truncate(line, width - 1))
 
             stdscr.refresh()
             k = stdscr.getch()
@@ -586,28 +645,26 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
             cursor_x = min(len(prompt) + cursor, width - 1)
             stdscr.move(1, cursor_x)
 
-            visible = height - 3
+            header, sep = _format_table_header(width, include_snippet=True)
+            stdscr.addstr(2, 0, header)
+            stdscr.addstr(3, 0, sep)
+
+            visible = height - 5
             if idx < offset:
                 offset = idx
             if idx >= offset + visible:
                 offset = idx - visible + 1
 
             if not rows:
-                stdscr.addstr(3, 0, _truncate("(no matches)", width - 1))
+                stdscr.addstr(4, 0, _truncate("(no matches)", width - 1))
             else:
                 for row_i in range(visible):
                     i = offset + row_i
                     if i >= len(rows):
                         break
                     r = rows[i]
-                    line = (
-                        f"{_fmt_ts(r.created_at)}  "
-                        f"{_fmt_ts(r.updated_at)}  "
-                        f"{r.session_id}  "
-                        f"{r.title}  "
-                        f"{r.snippet}"
-                    )
-                    y = 2 + row_i
+                    line = _format_table_row(r, width, include_snippet=True)
+                    y = 4 + row_i
                     if i == idx:
                         stdscr.addstr(y, 0, _truncate(line, width - 1), curses.A_REVERSE)
                     else:
