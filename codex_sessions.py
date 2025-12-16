@@ -10,7 +10,8 @@ import re
 import sqlite3
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -39,7 +40,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   cli_version TEXT,
   file_path TEXT NOT NULL,
   title TEXT,
-  preview TEXT
+  preview TEXT,
+  repo_root TEXT,
+  repo_name TEXT,
+  repo_branch TEXT,
+  repo_sha TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+  session_id TEXT PRIMARY KEY,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  tags TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS session_fts
@@ -51,7 +64,7 @@ USING fts5(
 );
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 PARSER_VERSION = 4
 
 
@@ -287,15 +300,35 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 conn.execute("ALTER TABLE sessions ADD COLUMN preview TEXT")
             except sqlite3.OperationalError:
                 pass
+        # v4: repo metadata + user session annotations.
+        if current < 4:
+            for col in ("repo_root", "repo_name", "repo_branch", "repo_sha"):
+                try:
+                    conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                  session_id TEXT PRIMARY KEY,
+                  pinned INTEGER NOT NULL DEFAULT 0,
+                  tags TEXT NOT NULL DEFAULT '',
+                  note TEXT NOT NULL DEFAULT '',
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
 
         _set_meta(conn, "schema_version", str(SCHEMA_VERSION))
 
 
-def index_sessions(db_path: Path, codex_dir: Path) -> int:
+def index_sessions(db_path: Path, codex_dir: Path, force: bool = False) -> int:
     conn = connect_db(db_path)
     changed = 0
     now = int(dt.datetime.now().timestamp())
     force_reindex = False
+    git_cache: dict[str, tuple[str, str, str, str]] = {}
 
     with conn:
         pv = _get_meta(conn, "parser_version")
@@ -303,9 +336,13 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
         if current != PARSER_VERSION:
             force_reindex = True
             _set_meta(conn, "parser_version", str(PARSER_VERSION))
+        if force:
+            force_reindex = True
 
     files = sorted(iter_session_files(codex_dir))
     with conn:
+        _set_meta(conn, "last_index_started_at", str(now))
+        _set_meta(conn, "last_index_reason", "forced" if force else ("parser_bump" if force_reindex else "incremental"))
         for p in files:
             try:
                 st = p.stat()
@@ -329,10 +366,53 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
             if doc is None:
                 continue
 
+            repo_root = ""
+            repo_name = ""
+            repo_branch = ""
+            repo_sha = ""
+            if doc.cwd:
+                if doc.cwd in git_cache:
+                    repo_root, repo_name, repo_branch, repo_sha = git_cache[doc.cwd]
+                else:
+                    try:
+                        proc = subprocess.run(
+                            ["git", "-C", doc.cwd, "rev-parse", "--show-toplevel"],
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                        )
+                        top = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+                        if top:
+                            repo_root = top
+                            repo_name = Path(top).name
+                            b = subprocess.run(
+                                ["git", "-C", doc.cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                                check=False,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                text=True,
+                            )
+                            s = subprocess.run(
+                                ["git", "-C", doc.cwd, "rev-parse", "--short", "HEAD"],
+                                check=False,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                text=True,
+                            )
+                            repo_branch = (b.stdout or "").strip() if b.returncode == 0 else ""
+                            repo_sha = (s.stdout or "").strip() if s.returncode == 0 else ""
+                    except Exception:
+                        pass
+                    git_cache[doc.cwd] = (repo_root, repo_name, repo_branch, repo_sha)
+
             conn.execute(
                 """
-                INSERT INTO sessions(session_id, created_at, updated_at, cwd, cli_version, file_path, title, preview)
-                VALUES(?,?,?,?,?,?,?,?)
+                INSERT INTO sessions(
+                  session_id, created_at, updated_at, cwd, cli_version, file_path, title, preview,
+                  repo_root, repo_name, repo_branch, repo_sha
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id) DO UPDATE SET
                   created_at=excluded.created_at,
                   updated_at=excluded.updated_at,
@@ -340,7 +420,11 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
                   cli_version=excluded.cli_version,
                   file_path=excluded.file_path,
                   title=excluded.title,
-                  preview=excluded.preview
+                  preview=excluded.preview,
+                  repo_root=excluded.repo_root,
+                  repo_name=excluded.repo_name,
+                  repo_branch=excluded.repo_branch,
+                  repo_sha=excluded.repo_sha
                 """,
                 (
                     doc.session_id,
@@ -351,7 +435,15 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
                     doc.file_path,
                     doc.title,
                     doc.preview,
+                    repo_root,
+                    repo_name,
+                    repo_branch,
+                    repo_sha,
                 ),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_sessions(session_id, updated_at) VALUES(?, ?)",
+                (doc.session_id, now),
             )
 
             conn.execute("DELETE FROM session_fts WHERE session_id = ?", (doc.session_id,))
@@ -373,6 +465,8 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
             )
             changed += 1
 
+        _set_meta(conn, "last_index_finished_at", str(int(time.time())))
+
     conn.close()
     return changed
 
@@ -386,11 +480,20 @@ class SearchRow:
     title: str
     snippet: str
     score: float
+    pinned: int
+    tags: str
+    note: str
+    file_path: str
+    repo_name: str
+    repo_branch: str
+    repo_sha: str
 
 
-def search_sessions(db_path: Path, query: str, limit: int) -> list[SearchRow]:
+def search_sessions(db_path: Path, query: str, limit: int, now: Optional[int] = None) -> list[SearchRow]:
     conn = connect_db(db_path)
     conn.row_factory = sqlite3.Row
+    now_val = int(now or time.time())
+    recency_weight = 0.15
     rows = conn.execute(
         """
         SELECT
@@ -400,14 +503,22 @@ def search_sessions(db_path: Path, query: str, limit: int) -> list[SearchRow]:
           COALESCE(s.cwd, '') AS cwd,
           COALESCE(s.title, '') AS title,
           snippet(session_fts, 1, '[', ']', '…', 14) AS snippet,
-          bm25(session_fts) AS score
+          (bm25(session_fts) + ((? - s.updated_at) / 86400.0) * ?) AS score,
+          COALESCE(u.pinned, 0) AS pinned,
+          COALESCE(u.tags, '') AS tags,
+          COALESCE(u.note, '') AS note,
+          COALESCE(s.file_path, '') AS file_path,
+          COALESCE(s.repo_name, '') AS repo_name,
+          COALESCE(s.repo_branch, '') AS repo_branch,
+          COALESCE(s.repo_sha, '') AS repo_sha
         FROM session_fts
         JOIN sessions s ON s.session_id = session_fts.session_id
+        LEFT JOIN user_sessions u ON u.session_id = s.session_id
         WHERE session_fts MATCH ?
-        ORDER BY score
+        ORDER BY pinned DESC, score
         LIMIT ?
         """,
-        (query, limit),
+        (now_val, recency_weight, query, limit),
     ).fetchall()
     conn.close()
 
@@ -422,6 +533,13 @@ def search_sessions(db_path: Path, query: str, limit: int) -> list[SearchRow]:
                 title=r["title"],
                 snippet=r["snippet"] or "",
                 score=float(r["score"]),
+                pinned=int(r["pinned"]),
+                tags=r["tags"] or "",
+                note=r["note"] or "",
+                file_path=r["file_path"] or "",
+                repo_name=r["repo_name"] or "",
+                repo_branch=r["repo_branch"] or "",
+                repo_sha=r["repo_sha"] or "",
             )
         )
     return out
@@ -433,15 +551,23 @@ def list_sessions(db_path: Path, limit: int) -> list[SearchRow]:
     rows = conn.execute(
         """
         SELECT
-          session_id,
-          created_at,
-          updated_at,
-          COALESCE(cwd, '') AS cwd,
-          COALESCE(title, '') AS title,
-          COALESCE(preview, '') AS snippet,
-          0.0 AS score
-        FROM sessions
-        ORDER BY updated_at DESC
+          s.session_id,
+          s.created_at,
+          s.updated_at,
+          COALESCE(s.cwd, '') AS cwd,
+          COALESCE(s.title, '') AS title,
+          COALESCE(s.preview, '') AS snippet,
+          0.0 AS score,
+          COALESCE(u.pinned, 0) AS pinned,
+          COALESCE(u.tags, '') AS tags,
+          COALESCE(u.note, '') AS note,
+          COALESCE(s.file_path, '') AS file_path,
+          COALESCE(s.repo_name, '') AS repo_name,
+          COALESCE(s.repo_branch, '') AS repo_branch,
+          COALESCE(s.repo_sha, '') AS repo_sha
+        FROM sessions s
+        LEFT JOIN user_sessions u ON u.session_id = s.session_id
+        ORDER BY pinned DESC, s.updated_at DESC
         LIMIT ?
         """,
         (limit,),
@@ -459,6 +585,13 @@ def list_sessions(db_path: Path, limit: int) -> list[SearchRow]:
                 title=r["title"],
                 snippet=r["snippet"] or "",
                 score=float(r["score"]),
+                pinned=int(r["pinned"]),
+                tags=r["tags"] or "",
+                note=r["note"] or "",
+                file_path=r["file_path"] or "",
+                repo_name=r["repo_name"] or "",
+                repo_branch=r["repo_branch"] or "",
+                repo_sha=r["repo_sha"] or "",
             )
         )
     return out
@@ -498,7 +631,7 @@ def _truncate(s: str, width: int) -> str:
 def _format_table_row(r: SearchRow, width: int, include_snippet: bool) -> str:
     created = _fmt_ts(r.created_at)
     updated = _fmt_ts(r.updated_at)
-    sid = r.session_id[:8]
+    sid = (r.session_id[:7] + ("★" if getattr(r, "pinned", 0) else " ")).ljust(8)
 
     # Fixed columns + spaces:
     # 16 +1 +16 +1 +8 +1 = 43, leaving remainder for title/snippet.
@@ -517,9 +650,9 @@ def _format_table_header(width: int, include_snippet: bool) -> tuple[str, str]:
     title_w = min(80, max(22, remaining // (2 if include_snippet else 1)))
     snippet_w = max(0, remaining - title_w - (1 if include_snippet else 0))
     if include_snippet and snippet_w > 0:
-        hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID':<8} {'TITLE':<{title_w}} {'MATCH':<{snippet_w}}"
+        hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID★':<8} {'TITLE':<{title_w}} {'MATCH':<{snippet_w}}"
     else:
-        hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID':<8} {'TITLE':<{title_w}}"
+        hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID★':<8} {'TITLE':<{title_w}}"
     return _truncate(hdr, width - 1), _truncate("-" * (width - 1), width - 1)
 
 
@@ -606,17 +739,138 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
     conn = connect_db(db_path)
     conn.row_factory = sqlite3.Row
 
-    def _fetch_rows(q: str) -> list[SearchRow]:
-        q = q.strip()
+    def _get_meta_str(key: str) -> str:
         try:
+            v = _get_meta(conn, key)
+            return v or ""
+        except Exception:
+            return ""
+
+    def _wrap(text: str, w: int) -> list[str]:
+        if w <= 1:
+            return [""]
+        words = (text or "").replace("\r", "").split()
+        lines: list[str] = []
+        cur: list[str] = []
+        cur_len = 0
+        for word in words:
+            add = len(word) + (1 if cur else 0)
+            if cur_len + add <= w:
+                cur.append(word)
+                cur_len += add
+                continue
+            if cur:
+                lines.append(" ".join(cur))
+            cur = [word]
+            cur_len = len(word)
+        if cur:
+            lines.append(" ".join(cur))
+        return lines or [""]
+
+    def _prompt(stdscr, prompt: str, initial: str = "") -> Optional[str]:
+        height, width = stdscr.getmaxyx()
+        y = height - 1
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        stdscr.addstr(y, 0, _truncate(prompt, width - 1))
+        stdscr.refresh()
+        curses.echo()
+        try:
+            buf = stdscr.getstr(y, min(len(prompt), width - 1), max(1, width - len(prompt) - 1))
+        except Exception:
+            curses.noecho()
+            return None
+        curses.noecho()
+        try:
+            s = buf.decode("utf-8", errors="replace")
+        except Exception:
+            s = str(buf)
+        s = s.strip()
+        if not s and initial:
+            return initial
+        return s
+
+    def _group_rows(rows: list[SearchRow]) -> list[SearchRow]:
+        grouped: dict[str, tuple[SearchRow, int]] = {}
+        for r in rows:
+            key = re.sub(r"\s+", " ", (r.title or "").strip().lower())
+            if not key:
+                key = r.session_id
+            if key not in grouped:
+                grouped[key] = (r, 1)
+                continue
+            cur, n = grouped[key]
+            best = r if r.updated_at >= cur.updated_at else cur
+            grouped[key] = (best, n + 1)
+        out: list[SearchRow] = []
+        for best, n in grouped.values():
+            if n <= 1:
+                out.append(best)
+            else:
+                out.append(replace(best, title=f"{best.title} (+{n-1})"))
+        out.sort(key=lambda r: (r.pinned, r.updated_at), reverse=True)
+        return out
+
+    def _apply_filters(
+        rows: list[SearchRow], repo: str, cwd: str, tag: str, pinned_only: bool, group_mode: bool
+    ) -> list[SearchRow]:
+        out: list[SearchRow] = []
+        for r in rows:
+            if pinned_only and not r.pinned:
+                continue
+            if repo and repo.lower() not in (r.repo_name or "").lower():
+                continue
+            if cwd and cwd.lower() not in (r.cwd or "").lower():
+                continue
+            if tag and tag.lower() not in (r.tags or "").lower():
+                continue
+            out.append(r)
+        return _group_rows(out) if group_mode else out
+
+    def _fetch_rows(q: str, repo: str, cwd: str, tag: str, pinned_only: bool, group_mode: bool) -> list[SearchRow]:
+        q = (q or "").strip()
+        try:
+            base: list[SearchRow]
             if not q or q == "*":
-                return list_sessions(db_path, limit)
-            fts = build_prefix_query(q)
-            if not fts:
-                return list_sessions(db_path, limit)
-            return search_sessions(db_path, fts, limit)
+                base = list_sessions(db_path, limit)
+            else:
+                fts = build_prefix_query(q)
+                base = search_sessions(db_path, fts, limit) if fts else list_sessions(db_path, limit)
+            return _apply_filters(base, repo, cwd, tag, pinned_only, group_mode)
         except sqlite3.OperationalError:
             return []
+
+    def _get_detail(session_id: str) -> dict:
+        row = conn.execute(
+            """
+            SELECT
+              s.session_id,
+              s.created_at,
+              s.updated_at,
+              COALESCE(s.cwd,'') AS cwd,
+              COALESCE(s.title,'') AS title,
+              COALESCE(s.file_path,'') AS file_path,
+              COALESCE(s.repo_name,'') AS repo_name,
+              COALESCE(s.repo_branch,'') AS repo_branch,
+              COALESCE(s.repo_sha,'') AS repo_sha,
+              COALESCE(u.pinned,0) AS pinned,
+              COALESCE(u.tags,'') AS tags,
+              COALESCE(u.note,'') AS note,
+              COALESCE(session_fts.content,'') AS content
+            FROM sessions s
+            LEFT JOIN user_sessions u ON u.session_id = s.session_id
+            LEFT JOIN session_fts ON session_fts.session_id = s.session_id
+            WHERE s.session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else {}
+
+    def _set_user_field(session_id: str, field: str, value) -> None:
+        now = int(time.time())
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO user_sessions(session_id, updated_at) VALUES(?, ?)", (session_id, now))
+            conn.execute(f"UPDATE user_sessions SET {field} = ?, updated_at = ? WHERE session_id = ?", (value, now, session_id))
 
     def _ui(stdscr) -> Optional[str]:
         curses.curs_set(1)
@@ -625,135 +879,328 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
         query = initial_query or ""
         cursor = len(query)
-        rows = _fetch_rows(query)
+        focus = "query"  # or "list"
+
+        filter_repo = ""
+        filter_cwd = ""
+        filter_tag = ""
+        pinned_only = False
+        group_mode = False
+
+        rows = _fetch_rows(query, filter_repo, filter_cwd, filter_tag, pinned_only, group_mode)
         idx = 0
         offset = 0
+        detail_cache: dict[str, dict] = {}
+        status_msg = ""
+        preview_tail = True
 
-        def _clamp_idx():
+        def _clamp():
             nonlocal idx, offset
             if rows:
                 idx = max(0, min(idx, len(rows) - 1))
             else:
                 idx = 0
-            offset = 0
+            if idx < offset:
+                offset = idx
 
-        _clamp_idx()
+        def _refresh_rows(reset_selection: bool = False):
+            nonlocal rows, idx, offset
+            rows = _fetch_rows(query, filter_repo, filter_cwd, filter_tag, pinned_only, group_mode)
+            if reset_selection:
+                idx = 0
+                offset = 0
+            _clamp()
+
+        def _selected_id() -> str:
+            if not rows:
+                return ""
+            return rows[idx].session_id
+
+        _clamp()
 
         while True:
             stdscr.erase()
             height, width = stdscr.getmaxyx()
-            if height < 6 or width < 60:
-                stdscr.addstr(0, 0, "Terminal too small (need ~60x6). Press q to quit.")
+            if height < 12 or width < 110:
+                stdscr.addstr(0, 0, "Terminal too small (need ~110x12). Press q to quit.")
                 stdscr.refresh()
                 k = stdscr.getch()
                 if k in (ord("q"), 27):
                     return None
                 continue
 
-            help_line = "Type to search (prefix). Enter:resume  ↑/↓ select  Backspace:edit  Ctrl-U:clear  p:print id  c:copy id  q:quit"
+            left_w = max(60, int(width * 0.56))
+            right_w = width - left_w - 1
+            list_top = 3
+            list_bottom = height - 2
+            list_h = max(1, list_bottom - list_top)
+
+            help_line = "Enter resume | Tab focus | / query focus | ↑/↓ PgUp/PgDn navigate | x pin | t tags | n note | f repo | d cwd | F tag | P pinned | g group | y copy id | c copy cmd | o open jsonl | R reindex | Esc clear | q quit"
             stdscr.addstr(0, 0, _truncate(help_line, width - 1))
 
-            prompt = "Query: "
-            stdscr.addstr(1, 0, prompt)
-            stdscr.addstr(1, len(prompt), _truncate(query, max(0, width - len(prompt) - 1)))
-            # Cursor position within query line.
-            cursor_x = min(len(prompt) + cursor, width - 1)
-            stdscr.move(1, cursor_x)
+            prompt = f"Query({focus}): "
+            stdscr.addstr(1, 0, _truncate(prompt, left_w - 1))
+            stdscr.addstr(1, len(prompt), _truncate(query, max(0, left_w - len(prompt) - 1)))
+            if focus == "query":
+                stdscr.move(1, min(len(prompt) + cursor, left_w - 1))
 
-            header, sep = _format_table_header(width, include_snippet=True)
-            stdscr.addstr(2, 0, header)
-            stdscr.addstr(3, 0, sep)
+            # Filters/status line.
+            idx_info = f"{idx+1}/{len(rows)}" if rows else "0/0"
+            filt_bits = []
+            if filter_repo:
+                filt_bits.append(f"repo~{filter_repo}")
+            if filter_cwd:
+                filt_bits.append(f"cwd~{filter_cwd}")
+            if filter_tag:
+                filt_bits.append(f"tag~{filter_tag}")
+            if pinned_only:
+                filt_bits.append("pinned")
+            if group_mode:
+                filt_bits.append("grouped")
+            filt = " | ".join(filt_bits) if filt_bits else "no filters"
+            indexed_at = _get_meta_str("last_index_finished_at") or "?"
+            try:
+                indexed_at_h = _fmt_ts(int(indexed_at))
+            except Exception:
+                indexed_at_h = "?"
+            status = f"{idx_info} | {filt} | indexed {indexed_at_h}"
+            if status_msg:
+                status = status + f" | {status_msg}"
+            stdscr.addstr(2, 0, _truncate(status, width - 1))
 
-            visible = height - 5
+            # Draw vertical separator.
+            for y in range(3, height - 1):
+                stdscr.addstr(y, left_w, "|")
+
+            # Left header and list.
+            header, sep = _format_table_header(left_w, include_snippet=False)
+            stdscr.addstr(3, 0, header)
+            stdscr.addstr(4, 0, sep)
+
+            visible = max(1, list_h - 2)
             if idx < offset:
                 offset = idx
             if idx >= offset + visible:
                 offset = idx - visible + 1
 
-            if not rows:
-                stdscr.addstr(4, 0, _truncate("(no matches)", width - 1))
+            for row_i in range(visible):
+                i = offset + row_i
+                if i >= len(rows):
+                    break
+                r = rows[i]
+                line = _format_table_row(r, left_w, include_snippet=False)
+                y = 5 + row_i
+                if i == idx:
+                    stdscr.addstr(y, 0, _truncate(line, left_w - 1), curses.A_REVERSE)
+                else:
+                    stdscr.addstr(y, 0, _truncate(line, left_w - 1))
+
+            # Right preview.
+            sid = _selected_id()
+            detail = {}
+            if sid:
+                if sid not in detail_cache:
+                    detail_cache[sid] = _get_detail(sid)
+                detail = detail_cache.get(sid) or {}
+
+            rx = left_w + 1
+            stdscr.addstr(3, rx, _truncate("PREVIEW", right_w - 1))
+            stdscr.addstr(4, rx, _truncate("-" * (right_w - 1), right_w - 1))
+            if not detail:
+                stdscr.addstr(5, rx, _truncate("(no selection)", right_w - 1))
             else:
-                for row_i in range(visible):
-                    i = offset + row_i
-                    if i >= len(rows):
+                meta_lines = [
+                    f"id: {detail.get('session_id','')}",
+                    f"created: {_fmt_ts(int(detail.get('created_at',0)))}  updated: {_fmt_ts(int(detail.get('updated_at',0)))}",
+                    f"repo: {detail.get('repo_name','') or '-'}  branch: {detail.get('repo_branch','') or '-'}  sha: {detail.get('repo_sha','') or '-'}",
+                    f"cwd: {detail.get('cwd','') or '-'}",
+                    f"tags: {detail.get('tags','') or '-'}",
+                    f"note: {detail.get('note','') or '-'}",
+                ]
+                y = 5
+                for ml in meta_lines:
+                    if y >= height - 2:
                         break
-                    r = rows[i]
-                    line = _format_table_row(r, width, include_snippet=True)
-                    y = 4 + row_i
-                    if i == idx:
-                        stdscr.addstr(y, 0, _truncate(line, width - 1), curses.A_REVERSE)
-                    else:
-                        stdscr.addstr(y, 0, _truncate(line, width - 1))
+                    for wline in _wrap(ml, right_w - 1):
+                        if y >= height - 2:
+                            break
+                        stdscr.addstr(y, rx, _truncate(wline, right_w - 1))
+                        y += 1
+
+                if y < height - 2:
+                    stdscr.addstr(y, rx, _truncate("-" * (right_w - 1), right_w - 1))
+                    y += 1
+
+                content = detail.get("content", "") or ""
+                content_lines = content.splitlines()
+                if preview_tail and len(content_lines) > 120:
+                    content_lines = content_lines[-120:]
+                for line in content_lines:
+                    if y >= height - 2:
+                        break
+                    for wline in _wrap(line, right_w - 1):
+                        if y >= height - 2:
+                            break
+                        stdscr.addstr(y, rx, _truncate(wline, right_w - 1))
+                        y += 1
 
             stdscr.refresh()
             k = stdscr.getch()
+            status_msg = ""
 
-            if k in (ord("q"), 27):
+            if k in (ord("q"),):
                 return None
-            if k in (curses.KEY_UP, ord("k")):
-                if rows:
-                    idx = max(0, idx - 1)
-                continue
-            if k in (curses.KEY_DOWN, ord("j")):
-                if rows:
-                    idx = min(len(rows) - 1, idx + 1)
-                continue
-            if k in (curses.KEY_LEFT,):
-                cursor = max(0, cursor - 1)
-                continue
-            if k in (curses.KEY_RIGHT,):
-                cursor = min(len(query), cursor + 1)
-                continue
-            if k in (curses.KEY_HOME,):
-                cursor = 0
-                continue
-            if k in (curses.KEY_END,):
-                cursor = len(query)
-                continue
-            if k in (curses.KEY_BACKSPACE, 127, 8):
-                if cursor > 0:
-                    query = query[: cursor - 1] + query[cursor:]
-                    cursor -= 1
-                    rows = _fetch_rows(query)
-                    idx = 0
-                    offset = 0
-                continue
-            if k == curses.KEY_DC:
-                if cursor < len(query):
-                    query = query[:cursor] + query[cursor + 1 :]
-                    rows = _fetch_rows(query)
-                    idx = 0
-                    offset = 0
-                continue
-            if k in (21,):  # Ctrl-U
+            if k in (27,):  # ESC
                 query = ""
                 cursor = 0
-                rows = _fetch_rows(query)
-                idx = 0
-                offset = 0
+                _refresh_rows(reset_selection=True)
                 continue
-            if k in (curses.KEY_ENTER, 10, 13):
-                if rows:
-                    return f"__RESUME__ {rows[idx].session_id}"
+            if k in (9,):  # TAB
+                focus = "list" if focus == "query" else "query"
                 continue
-            if k == ord("p"):
-                if rows:
-                    return rows[idx].session_id
-                continue
-            if k == ord("c"):
-                if rows:
-                    _copy_to_clipboard(rows[idx].session_id)
+            if k in (ord("/"),):
+                focus = "query"
                 continue
 
-            # Printable characters.
-            if 32 <= k <= 126:
-                ch = chr(k)
-                query = query[:cursor] + ch + query[cursor:]
-                cursor += 1
-                rows = _fetch_rows(query)
+            if k in (curses.KEY_UP, ord("k"), 16):  # Ctrl-P
+                if rows:
+                    idx = max(0, idx - 1)
+                    _clamp()
+                continue
+            if k in (curses.KEY_DOWN, ord("j"), 14):  # Ctrl-N
+                if rows:
+                    idx = min(len(rows) - 1, idx + 1)
+                    _clamp()
+                continue
+            if k == curses.KEY_NPAGE:  # PgDn
+                if rows:
+                    idx = min(len(rows) - 1, idx + visible)
+                    _clamp()
+                continue
+            if k == curses.KEY_PPAGE:  # PgUp
+                if rows:
+                    idx = max(0, idx - visible)
+                    _clamp()
+                continue
+            if k == curses.KEY_HOME:
                 idx = 0
                 offset = 0
                 continue
+            if k == curses.KEY_END and rows:
+                idx = len(rows) - 1
+                _clamp()
+                continue
+
+            sid = _selected_id()
+            if k in (curses.KEY_ENTER, 10, 13):
+                if sid:
+                    return f"__RESUME__ {sid}"
+                continue
+            if k == ord("y") and sid:
+                _copy_to_clipboard(sid)
+                status_msg = "copied id"
+                continue
+            if k == ord("c") and sid:
+                _copy_to_clipboard(f"codex resume {sid}")
+                status_msg = "copied cmd"
+                continue
+            if k == ord("o") and sid:
+                fp = (detail or {}).get("file_path", "") if detail else ""
+                if not fp:
+                    fp = rows[idx].file_path
+                if fp:
+                    return f"__OPEN__ {fp}"
+                status_msg = "no file_path"
+                continue
+
+            if k == ord("x") and sid:
+                new_val = 0 if rows[idx].pinned else 1
+                _set_user_field(sid, "pinned", new_val)
+                if sid in detail_cache:
+                    detail_cache.pop(sid, None)
+                _refresh_rows()
+                status_msg = "pinned" if new_val else "unpinned"
+                continue
+            if k == ord("t") and sid:
+                current_tags = (detail or {}).get("tags", "") if detail else rows[idx].tags
+                new_tags = _prompt(stdscr, "tags (space/comma separated): ", current_tags)
+                if new_tags is not None:
+                    _set_user_field(sid, "tags", new_tags)
+                    detail_cache.pop(sid, None)
+                    _refresh_rows()
+                continue
+            if k == ord("n") and sid:
+                current_note = (detail or {}).get("note", "") if detail else rows[idx].note
+                new_note = _prompt(stdscr, "note: ", current_note)
+                if new_note is not None:
+                    _set_user_field(sid, "note", new_note)
+                    detail_cache.pop(sid, None)
+                continue
+
+            if k == ord("f"):
+                filter_repo = _prompt(stdscr, "filter repo (empty clears): ", filter_repo) or ""
+                _refresh_rows(reset_selection=True)
+                continue
+            if k == ord("d"):
+                filter_cwd = _prompt(stdscr, "filter cwd contains (empty clears): ", filter_cwd) or ""
+                _refresh_rows(reset_selection=True)
+                continue
+            if k == ord("F"):
+                filter_tag = _prompt(stdscr, "filter tag contains (empty clears): ", filter_tag) or ""
+                _refresh_rows(reset_selection=True)
+                continue
+            if k == ord("P"):
+                pinned_only = not pinned_only
+                _refresh_rows(reset_selection=True)
+                continue
+            if k == ord("g"):
+                group_mode = not group_mode
+                _refresh_rows(reset_selection=True)
+                continue
+
+            if k == ord("R"):
+                # Force reindex.
+                index_sessions(db_path, Path(os.path.expanduser("~")) / ".codex", force=True)
+                detail_cache.clear()
+                _refresh_rows(reset_selection=True)
+                status_msg = "reindexed"
+                continue
+
+            if k == ord("v"):
+                preview_tail = not preview_tail
+                continue
+
+            if focus == "query":
+                if k in (curses.KEY_LEFT,):
+                    cursor = max(0, cursor - 1)
+                    continue
+                if k in (curses.KEY_RIGHT,):
+                    cursor = min(len(query), cursor + 1)
+                    continue
+                if k in (curses.KEY_BACKSPACE, 127, 8):
+                    if cursor > 0:
+                        query = query[: cursor - 1] + query[cursor:]
+                        cursor -= 1
+                        _refresh_rows(reset_selection=True)
+                    continue
+                if k == curses.KEY_DC:
+                    if cursor < len(query):
+                        query = query[:cursor] + query[cursor + 1 :]
+                        _refresh_rows(reset_selection=True)
+                    continue
+                if k in (21,):  # Ctrl-U
+                    query = ""
+                    cursor = 0
+                    _refresh_rows(reset_selection=True)
+                    continue
+                if 32 <= k <= 126:
+                    ch = chr(k)
+                    query = query[:cursor] + ch + query[cursor:]
+                    cursor += 1
+                    _refresh_rows(reset_selection=True)
+                    continue
+
+            # When focus=list, ignore typing.
 
     selected = curses.wrapper(_ui)
     conn.close()
@@ -766,7 +1213,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
 
 def cmd_index(args: argparse.Namespace) -> int:
-    changed = index_sessions(args.db, args.codex_dir)
+    changed = index_sessions(args.db, args.codex_dir, force=args.reindex)
     if args.quiet:
         return 0
     print(f"Indexed {changed} updated/new session file(s) into {args.db}")
@@ -775,7 +1222,7 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     if not args.no_index:
-        index_sessions(args.db, args.codex_dir)
+        index_sessions(args.db, args.codex_dir, force=args.reindex)
 
     if args.all or not args.query or args.query.strip() in ("*", ""):
         rows = list_sessions(args.db, args.limit)
@@ -807,7 +1254,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_live(args: argparse.Namespace) -> int:
     if not args.no_index:
-        index_sessions(args.db, args.codex_dir)
+        index_sessions(args.db, args.codex_dir, force=args.reindex)
 
     selected = _run_curses_live(args.db, args.limit, args.query or "", auto_copy=args.copy)
     if not selected:
@@ -820,7 +1267,82 @@ def cmd_live(args: argparse.Namespace) -> int:
         os.execvp("codex", ["codex", "resume", session_id])
         return 1
 
+    if selected.startswith("__OPEN__ "):
+        path = selected.split(" ", 1)[1].strip()
+        editor = os.environ.get("EDITOR") or "vi"
+        os.execvp(editor, [editor, path])
+        return 1
+
     print(selected)
+    return 0
+
+
+def _redact_text(text: str) -> str:
+    s = text
+    s = s.replace(str(Path.home()), "~")
+    s = re.sub(r"gho_[A-Za-z0-9_]+", "gho_<REDACTED>", s)
+    s = re.sub(r"AKIA[0-9A-Z]{16}", "AKIA<REDACTED>", s)
+    s = re.sub(r"(?i)(secret|token|password)\\s*[:=]\\s*\\S+", r"\\1:<REDACTED>", s)
+    return s
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    conn = connect_db(args.db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT
+          s.session_id,
+          s.created_at,
+          s.updated_at,
+          COALESCE(s.cwd,'') AS cwd,
+          COALESCE(s.repo_name,'') AS repo_name,
+          COALESCE(s.repo_branch,'') AS repo_branch,
+          COALESCE(s.repo_sha,'') AS repo_sha,
+          COALESCE(u.tags,'') AS tags,
+          COALESCE(u.note,'') AS note,
+          COALESCE(session_fts.content,'') AS content
+        FROM sessions s
+        LEFT JOIN user_sessions u ON u.session_id = s.session_id
+        LEFT JOIN session_fts ON session_fts.session_id = s.session_id
+        WHERE s.session_id = ?
+        """,
+        (args.session_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        print("session not found", file=sys.stderr)
+        return 2
+
+    content = row["content"] or ""
+    if args.redact:
+        content = _redact_text(content)
+
+    out = [
+        f"# Codex session {row['session_id']}",
+        "",
+        f"- Created: {_fmt_ts(int(row['created_at']))}",
+        f"- Updated: {_fmt_ts(int(row['updated_at']))}",
+        f"- Repo: {row['repo_name'] or '-'} ({row['repo_branch'] or '-' } @ {row['repo_sha'] or '-'})",
+        f"- CWD: {row['cwd'] or '-'}",
+        f"- Tags: {row['tags'] or '-'}",
+        f"- Note: {row['note'] or '-'}",
+        "",
+        "## Transcript",
+        "",
+        "```",
+        content,
+        "```",
+        "",
+    ]
+    text = "\n".join(out)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    else:
+        try:
+            sys.stdout.write(text)
+        except BrokenPipeError:
+            return 0
     return 0
 
 
@@ -836,6 +1358,7 @@ def main(argv: list[str]) -> int:
     p_index.add_argument("--codex-dir", type=Path, default=default_codex_dir)
     p_index.add_argument("--db", type=Path, default=default_db)
     p_index.add_argument("--quiet", action="store_true")
+    p_index.add_argument("--reindex", action="store_true", help="Force re-parse all sessions.")
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Search sessions (interactive picker by default).")
@@ -845,6 +1368,7 @@ def main(argv: list[str]) -> int:
     p_search.add_argument("--limit", type=int, default=200)
     p_search.add_argument("--all", action="store_true", help="Browse most recent sessions (ignore query).")
     p_search.add_argument("--no-index", action="store_true", help="Skip auto indexing.")
+    p_search.add_argument("--reindex", action="store_true", help="Force re-parse all sessions before searching.")
     p_search.add_argument("--no-ui", action="store_true", help="Print results, no interactive picker.")
     p_search.add_argument("--copy", action="store_true", help="Copy selected id to clipboard (macOS pbcopy).")
     p_search.set_defaults(func=cmd_search)
@@ -855,8 +1379,16 @@ def main(argv: list[str]) -> int:
     p_live.add_argument("--db", type=Path, default=default_db)
     p_live.add_argument("--limit", type=int, default=200)
     p_live.add_argument("--no-index", action="store_true", help="Skip auto indexing.")
+    p_live.add_argument("--reindex", action="store_true", help="Force re-parse all sessions before opening UI.")
     p_live.add_argument("--copy", action="store_true", help="Copy selected id to clipboard (macOS pbcopy).")
     p_live.set_defaults(func=cmd_live)
+
+    p_export = sub.add_parser("export", help="Export a session to Markdown (optionally redacted).")
+    p_export.add_argument("session_id")
+    p_export.add_argument("--db", type=Path, default=default_db)
+    p_export.add_argument("--out", help="Output path (defaults to stdout).")
+    p_export.add_argument("--redact", action="store_true", help="Best-effort redaction of obvious secrets/paths.")
+    p_export.set_defaults(func=cmd_export)
 
     args = p.parse_args(argv)
     return int(args.func(args) or 0)
