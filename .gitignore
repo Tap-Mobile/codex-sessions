@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.db
+*.db-*
+
+# Local indices/logs (never commit)
+session-index.log
+

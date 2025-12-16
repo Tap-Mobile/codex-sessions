@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+python3 "$HOME/.codex-user/codex_sessions.py" index "$@"
+
