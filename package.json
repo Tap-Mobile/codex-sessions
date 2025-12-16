@@ -1,0 +1,30 @@
+{
+  "name": "codex-sessions",
+  "version": "0.1.0",
+  "description": "Local full-text search + resume picker for Codex CLI sessions (Python TUI wrapped for npx/npm).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tap-Mobile/codex-sessions.git"
+  },
+  "homepage": "https://github.com/Tap-Mobile/codex-sessions",
+  "bugs": {
+    "url": "https://github.com/Tap-Mobile/codex-sessions/issues"
+  },
+  "bin": {
+    "codex-sessions": "npm-bin/codex-sessions.js",
+    "codex_sessions": "npm-bin/codex-sessions.js"
+  },
+  "files": [
+    "codex_sessions.py",
+    "codex_session_index.zsh",
+    "bin/",
+    "npm-bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
+

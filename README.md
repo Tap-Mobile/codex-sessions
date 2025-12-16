@@ -18,6 +18,26 @@ If this saves you time, star the repo so others can find it.
 ## Install (macOS / zsh)
 This tool is fully local; it does not send session content anywhere.
 
+### Option A: run instantly (recommended)
+No install, no shell config. This runs the TUI directly:
+
+- `npx codex-sessions`
+- `npx codex-sessions "vllm"`
+
+Requirements:
+- `python3` available on PATH
+- `codex` available on PATH (to resume)
+
+### Option B: install globally (npm)
+Installs a `codex-sessions` (and `codex_sessions`) command:
+
+- `npm i -g codex-sessions`
+- `codex-sessions`
+
+Uninstall:
+- `npm uninstall -g codex-sessions`
+
+### Option C: manual install (macOS / zsh)
 1) Copy files:
 - `mkdir -p ~/.codex-user ~/.local/bin`
 - `cp codex_sessions.py ~/.codex-user/codex_sessions.py`
@@ -38,6 +58,9 @@ This tool is fully local; it does not send session content anywhere.
 - Plain output (no UI): `codex_sessions_search "query" --no-ui --limit 20`
 - Browse most recent (no query): `codex_sessions_search --all`
 - Export a session: `python3 ~/.codex-user/codex_sessions.py export <SESSION_ID> --out session.md --redact`
+
+### Quick start (npx)
+- `npx codex-sessions` then type a query, press Enter to resume.
 
 ## Keybindings (live UI)
 - Search: type; `Tab` toggles focus query/list; `Esc` clears query
