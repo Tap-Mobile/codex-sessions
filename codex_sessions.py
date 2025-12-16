@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   cwd TEXT,
   cli_version TEXT,
   file_path TEXT NOT NULL,
-  title TEXT
+  title TEXT,
+  preview TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS session_fts
@@ -50,8 +51,8 @@ USING fts5(
 );
 """
 
-SCHEMA_VERSION = 2
-PARSER_VERSION = 3
+SCHEMA_VERSION = 3
+PARSER_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ class SessionDoc:
     cli_version: str
     file_path: str
     title: str
+    preview: str
     content: str
 
 
@@ -184,15 +186,18 @@ def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
     if updated_at is None:
         updated_at = created_at
 
-    title = ""
+    user_messages: list[str] = []
     for role, text in messages:
         if role == "user":
             if len(text) < 8:
                 continue
-            title = text[:120]
-            break
+            user_messages.append(text)
+    title = user_messages[0][:200] if user_messages else ""
     if not title:
         title = path.name
+    preview = ""
+    if user_messages:
+        preview = user_messages[-1][:240]
 
     content_lines: list[str] = []
     for role, text in messages:
@@ -207,6 +212,7 @@ def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
         cli_version=cli_version,
         file_path=str(path),
         title=title,
+        preview=preview,
         content=content,
     )
 
@@ -275,6 +281,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 pass
             conn.execute("ALTER TABLE session_fts_v2 RENAME TO session_fts")
 
+        # v3: add per-session preview for browse mode.
+        if current < 3:
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN preview TEXT")
+            except sqlite3.OperationalError:
+                pass
+
         _set_meta(conn, "schema_version", str(SCHEMA_VERSION))
 
 
@@ -318,15 +331,16 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
 
             conn.execute(
                 """
-                INSERT INTO sessions(session_id, created_at, updated_at, cwd, cli_version, file_path, title)
-                VALUES(?,?,?,?,?,?,?)
+                INSERT INTO sessions(session_id, created_at, updated_at, cwd, cli_version, file_path, title, preview)
+                VALUES(?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id) DO UPDATE SET
                   created_at=excluded.created_at,
                   updated_at=excluded.updated_at,
                   cwd=excluded.cwd,
                   cli_version=excluded.cli_version,
                   file_path=excluded.file_path,
-                  title=excluded.title
+                  title=excluded.title,
+                  preview=excluded.preview
                 """,
                 (
                     doc.session_id,
@@ -336,6 +350,7 @@ def index_sessions(db_path: Path, codex_dir: Path) -> int:
                     doc.cli_version,
                     doc.file_path,
                     doc.title,
+                    doc.preview,
                 ),
             )
 
@@ -423,7 +438,7 @@ def list_sessions(db_path: Path, limit: int) -> list[SearchRow]:
           updated_at,
           COALESCE(cwd, '') AS cwd,
           COALESCE(title, '') AS title,
-          '' AS snippet,
+          COALESCE(preview, '') AS snippet,
           0.0 AS score
         FROM sessions
         ORDER BY updated_at DESC
@@ -488,7 +503,7 @@ def _format_table_row(r: SearchRow, width: int, include_snippet: bool) -> str:
     # Fixed columns + spaces:
     # 16 +1 +16 +1 +8 +1 = 43, leaving remainder for title/snippet.
     remaining = max(0, width - 1 - 43)
-    title_w = min(48, max(18, remaining // (2 if include_snippet else 1)))
+    title_w = min(80, max(22, remaining // (2 if include_snippet else 1)))
     snippet_w = max(0, remaining - title_w - (1 if include_snippet else 0))
 
     title = _truncate(r.title or "", title_w)
@@ -499,7 +514,7 @@ def _format_table_row(r: SearchRow, width: int, include_snippet: bool) -> str:
 
 def _format_table_header(width: int, include_snippet: bool) -> tuple[str, str]:
     remaining = max(0, width - 1 - 43)
-    title_w = min(48, max(18, remaining // (2 if include_snippet else 1)))
+    title_w = min(80, max(22, remaining // (2 if include_snippet else 1)))
     snippet_w = max(0, remaining - title_w - (1 if include_snippet else 0))
     if include_snippet and snippet_w > 0:
         hdr = f"{'CREATED':<16} {'UPDATED':<16} {'ID':<8} {'TITLE':<{title_w}} {'MATCH':<{snippet_w}}"
