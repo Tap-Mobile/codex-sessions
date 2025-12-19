@@ -1549,9 +1549,33 @@ def cmd_live(args: argparse.Namespace) -> int:
 def _redact_text(text: str) -> str:
     s = text
     s = s.replace(str(Path.home()), "~")
-    s = re.sub(r"gho_[A-Za-z0-9_]+", "gho_<REDACTED>", s)
+    s = re.sub(r"(?i)/Users/[^/\\s]+", "/Users/<REDACTED>", s)
+    s = re.sub(r"(?i)/home/[^/\\s]+", "/home/<REDACTED>", s)
+
+    # Common credential formats.
+    s = re.sub(r"ghp_[A-Za-z0-9]{30,}", "ghp_<REDACTED>", s)
+    s = re.sub(r"gho_[A-Za-z0-9_]{20,}", "gho_<REDACTED>", s)
+    s = re.sub(r"github_pat_[A-Za-z0-9_]{20,}", "github_pat_<REDACTED>", s)
+    s = re.sub(r"sk-[A-Za-z0-9]{20,}", "sk-<REDACTED>", s)
+    s = re.sub(r"xox[baprs]-[A-Za-z0-9-]{20,}", "xox<REDACTED>", s)
+    s = re.sub(r"AIza[0-9A-Za-z\\-_]{35}", "AIza<REDACTED>", s)
     s = re.sub(r"AKIA[0-9A-Z]{16}", "AKIA<REDACTED>", s)
-    s = re.sub(r"(?i)(secret|token|password)\\s*[:=]\\s*\\S+", r"\\1:<REDACTED>", s)
+    s = re.sub(r"ASIA[0-9A-Z]{16}", "ASIA<REDACTED>", s)
+
+    # Header-style tokens.
+    s = re.sub(r"(?i)Authorization:\\s*Bearer\\s+[^\\s]+", "Authorization: Bearer <REDACTED>", s)
+    s = re.sub(r"(?i)\\bBearer\\s+[A-Za-z0-9\\._\\-]{20,}\\b", "Bearer <REDACTED>", s)
+
+    # Key-value secrets.
+    s = re.sub(
+        r"(?i)\\b(secret|token|password|passwd|api[_-]?key|access[_-]?key|session[_-]?token)\\b\\s*[:=]\\s*[^\\s\\\"']+",
+        r"\\1=<REDACTED>",
+        s,
+    )
+
+    # Emails + IPs.
+    s = re.sub(r"\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b", "<REDACTED_EMAIL>", s)
+    s = re.sub(r"\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b", "<REDACTED_IP>", s)
     return s
 
 
