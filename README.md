@@ -4,67 +4,57 @@ Codex is great until you need to find that one session you had last week, rememb
 
 Codex Sessions gives you a fast, local, full‑text “resume picker”: type a query, see live results, preview the conversation, and press Enter to resume the exact session.
 
-## Features
-- Indexes your local Codex session logs from `~/.codex/sessions/**/*.jsonl`
-- Full‑text search via SQLite FTS5 (with recency bias)
-- 2‑pane TUI: searchable list + preview pane (so you can tell sessions apart)
-- One‑key resume: `Enter` runs `codex resume <session_id>`
-- Personal organization: pin, tag, and add notes (stored locally)
-- Filters: repo, cwd, tag, pinned‑only, and grouping of similar sessions
-- Safe sharing helpers: export to Markdown (`export`) with best‑effort `--redact`
+## Choose your setup
+
+### Option 1: Run instantly (recommended)
+```bash
+npx codex-sessions
+```
+
+### Option 2: Install globally (npm)
+```bash
+npm i -g codex-sessions
+codex-sessions
+```
+
+Uninstall:
+```bash
+npm uninstall -g codex-sessions
+```
+
+### Option 3: Manual install (shell scripts + zsh helpers)
+```bash
+mkdir -p ~/.codex-user ~/.local/bin
+cp codex_sessions.py ~/.codex-user/codex_sessions.py
+cp codex_session_index.zsh ~/.codex-user/codex_session_index.zsh
+cp bin/codex_sessions* ~/.local/bin/
+chmod +x ~/.codex-user/codex_sessions.py ~/.local/bin/codex_sessions*
+```
+
+Ensure `~/.local/bin` is on PATH (one-time):
+```bash
+source "$HOME/.local/bin/env"
+```
 
 If this saves you time, star the repo so others can find it.
 
-## Install (macOS / zsh)
-This tool is fully local; it does not send session content anywhere.
-
-### Option A: run instantly (recommended)
-No install, no shell config. This runs the TUI directly:
-
-- `npx codex-sessions`
-- `npx codex-sessions "vllm"`
-
-Requirements:
-- `python3` available on PATH
-- `codex` available on PATH (to resume)
-
-### Option B: install globally (npm)
-Installs a `codex-sessions` (and `codex_sessions`) command:
-
-- `npm i -g codex-sessions`
-- `codex-sessions`
-
-Uninstall:
-- `npm uninstall -g codex-sessions`
-
-This also installs `codex-agents` / `codex_agents` (tmux multi-agent runner).
-
-### Option C: manual install (macOS / zsh)
-1) Copy files:
-- `mkdir -p ~/.codex-user ~/.local/bin`
-- `cp codex_sessions.py ~/.codex-user/codex_sessions.py`
-- `cp codex_session_index.zsh ~/.codex-user/codex_session_index.zsh`
-- `cp bin/codex_sessions* ~/.local/bin/`
-- `chmod +x ~/.codex-user/codex_sessions.py ~/.local/bin/codex_sessions*`
-
-2) Ensure `~/.local/bin` is on PATH (one-time). If you already use `~/.local/bin/env`, source it from `~/.zprofile` or `~/.zshrc`:
-- `source "$HOME/.local/bin/env"`
-
-3) Source helpers (optional; enables Zsh functions):
-- `source "$HOME/.codex-user/codex_session_index.zsh"`
+## What it does
+- Indexes your local Codex session logs from `~/.codex/sessions/**/*.jsonl`
+- Full‑text search via SQLite FTS5 (with recency bias)
+- 2‑pane TUI: searchable list + preview pane
+- `Enter` resumes: runs `codex resume <session_id>`
+- Pin/tag/note + filters (repo/cwd/tag/pinned-only) + grouping
 
 ## Usage
-- Live UI: `codex_sessions` (type to search; results update live; Enter resumes)
-- Start with a query: `codex_sessions "vllm"`
-- Rebuild/refresh index: `codex_sessions_index` (add `--reindex` to force reparse)
-- Plain output (no UI): `codex_sessions_search "query" --no-ui --limit 20`
-- Browse most recent (no query): `codex_sessions_search --all`
-- Export a session: `python3 ~/.codex-user/codex_sessions.py export <SESSION_ID> --out session.md --redact`
- - Fork a session into a new Codex session (private, full context): `python3 ~/.codex-user/codex_sessions.py fork <SESSION_ID> --cd`
- - Share a session pack (redacted by default):
-   - Local file: `python3 ~/.codex-user/codex_sessions.py share <SESSION_ID> --method file`
-   - Private Gist: `python3 ~/.codex-user/codex_sessions.py share <SESSION_ID> --method gist`
- - Import a shared pack and start a new Codex session: `python3 ~/.codex-user/codex_sessions.py import ./codex-session-<ID>.md --cd`
+### Session picker
+- `codex-sessions` (or `codex_sessions`) opens the live UI
+- Type to search, preview on the right, `Enter` to resume
+
+### Fork (private) / Share (portable)
+- Fork (full context, starts a new Codex session): `python3 ~/.codex-user/codex_sessions.py fork <SESSION_ID> --cd`
+- Share as a local file (redacted by default): `python3 ~/.codex-user/codex_sessions.py share <SESSION_ID> --method file`
+- Share as a private Gist (redacted by default): `python3 ~/.codex-user/codex_sessions.py share <SESSION_ID> --method gist`
+- Import a pack: `python3 ~/.codex-user/codex_sessions.py import ./codex-session-<ID>.md --cd`
 
 ### Quick start (npx)
 - `npx codex-sessions` then type a query, press Enter to resume.
@@ -95,17 +85,16 @@ codex-agents stop
 ```
 
 ## Keybindings (live UI)
-- Search: type; `Tab` toggles focus query/list; `Esc` clears query
-- Navigate: `↑/↓`, `PgUp/PgDn`, `Home/End`
-- Resume: `Enter`
-- Organize: `x` pin/unpin, `t` tags, `n` note, `g` group similar titles
-- Filter: `f` repo, `d` cwd, `F` tag, `P` pinned‑only
-- Actions: `y` copy id, `c` copy resume command, `o` open session JSONL in `$EDITOR`, `K` fork, `S` share, `R` force reindex
-- Quit: `q`
+- `Enter` resume, `Tab` focus query/list, `Esc` clear
+- `↑/↓` / `PgUp/PgDn` / `Home/End` navigate
+- `x` pin, `t` tags, `n` note, `g` group
+- `f` repo filter, `d` cwd filter, `F` tag filter, `P` pinned-only
+- `y` copy id, `c` copy resume cmd, `o` open JSONL in `$EDITOR`
+- `K` fork, `S` share, `R` reindex, `q` quit
 
 ## Data & privacy
 - Index DB is stored locally (default: `~/.codex-user/codex_sessions.db`)
-- The DB contains plain-text excerpts from your Codex sessions; do not commit or share it.
+- The DB contains plain-text excerpts from your Codex sessions; do not commit it.
 - Pins/tags/notes are also stored locally in the same DB.
 
 ### Fork vs share
