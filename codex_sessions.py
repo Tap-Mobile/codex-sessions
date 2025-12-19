@@ -620,6 +620,247 @@ def _copy_to_clipboard(text: str) -> bool:
     return False
 
 
+def _have_gh() -> bool:
+    try:
+        res = subprocess.run(["gh", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _gh_authed() -> bool:
+    try:
+        res = subprocess.run(["gh", "auth", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _maybe_redact(text: str, redact: bool) -> str:
+    return _redact_text(text) if redact else text
+
+
+def _session_pack_paths(session_id: str, out_dir: Path) -> tuple[Path, Path]:
+    base = out_dir / f"codex-session-{session_id}"
+    return base.with_suffix(".json"), base.with_suffix(".md")
+
+
+def _build_pack(conn: sqlite3.Connection, session_id: str, *, redact: bool) -> dict:
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT
+          s.session_id,
+          s.created_at,
+          s.updated_at,
+          COALESCE(s.cwd,'') AS cwd,
+          COALESCE(s.file_path,'') AS file_path,
+          COALESCE(s.repo_root,'') AS repo_root,
+          COALESCE(s.repo_name,'') AS repo_name,
+          COALESCE(s.repo_branch,'') AS repo_branch,
+          COALESCE(s.repo_sha,'') AS repo_sha,
+          COALESCE(u.pinned,0) AS pinned,
+          COALESCE(u.tags,'') AS tags,
+          COALESCE(u.note,'') AS note,
+          COALESCE(session_fts.content,'') AS content
+        FROM sessions s
+        LEFT JOIN user_sessions u ON u.session_id = s.session_id
+        LEFT JOIN session_fts ON session_fts.session_id = s.session_id
+        WHERE s.session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("session not found")
+
+    content = _maybe_redact(row["content"] or "", redact)
+    cwd = _maybe_redact(row["cwd"] or "", redact)
+    file_path = _maybe_redact(row["file_path"] or "", redact)
+
+    return {
+        "schema": 1,
+        "created_at": int(row["created_at"]),
+        "updated_at": int(row["updated_at"]),
+        "session_id": row["session_id"],
+        "cwd": cwd,
+        "file_path": file_path,
+        "repo": {
+            "root": _maybe_redact(row["repo_root"] or "", redact),
+            "name": row["repo_name"] or "",
+            "branch": row["repo_branch"] or "",
+            "sha": row["repo_sha"] or "",
+        },
+        "annotations": {
+            "pinned": int(row["pinned"]),
+            "tags": row["tags"] or "",
+            "note": _maybe_redact(row["note"] or "", redact),
+        },
+        "content": content,
+        "redacted": bool(redact),
+    }
+
+
+def _pack_to_markdown(pack: dict) -> str:
+    repo = pack.get("repo") or {}
+    ann = pack.get("annotations") or {}
+    lines = [
+        f"# Codex session pack: {pack.get('session_id','')}",
+        "",
+        f"- Created: {_fmt_ts(int(pack.get('created_at', 0)))}",
+        f"- Updated: {_fmt_ts(int(pack.get('updated_at', 0)))}",
+        f"- Repo: {repo.get('name') or '-'} ({repo.get('branch') or '-'} @ {repo.get('sha') or '-'})",
+        f"- CWD: {pack.get('cwd') or '-'}",
+        f"- Tags: {ann.get('tags') or '-'}",
+        f"- Note: {ann.get('note') or '-'}",
+        f"- Redacted: {pack.get('redacted')}",
+        "",
+        "## Transcript",
+        "",
+        "```",
+        pack.get("content", "") or "",
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _truncate_for_prompt(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def cmd_fork(args: argparse.Namespace) -> int:
+    if not args.no_index:
+        index_sessions(args.db, args.codex_dir, force=args.reindex)
+
+    conn = connect_db(args.db)
+    try:
+        pack = _build_pack(conn, args.session_id, redact=False)
+    except ValueError as e:
+        conn.close()
+        print(str(e), file=sys.stderr)
+        return 2
+    conn.close()
+
+    # Write a local pack (private by default).
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json, out_md = _session_pack_paths(args.session_id, out_dir)
+    out_json.write_text(json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_md.write_text(_pack_to_markdown(pack), encoding="utf-8")
+
+    content_for_prompt = _truncate_for_prompt(pack.get("content", "") or "", args.max_chars)
+    prompt = (
+        "You are continuing work from a forked Codex session.\n"
+        f"Original session id: {args.session_id}\n"
+        f"Pack saved at: {out_md}\n\n"
+        "Use the transcript below as full context.\n\n"
+        "=== TRANSCRIPT (verbatim) ===\n"
+        f"{content_for_prompt}\n"
+        "=== END TRANSCRIPT ===\n"
+    )
+    if args.user_prompt:
+        prompt = prompt + "\nUser request for this fork:\n" + args.user_prompt.strip() + "\n"
+
+    cwd = pack.get("cwd") or ""
+    cmd = ["codex"]
+    if cwd and args.cd and Path(cwd).exists():
+        cmd += ["-C", cwd]
+    cmd.append(prompt)
+    os.execvp("codex", cmd)
+    return 1
+
+
+def cmd_share(args: argparse.Namespace) -> int:
+    if not args.no_index:
+        index_sessions(args.db, args.codex_dir, force=args.reindex)
+
+    conn = connect_db(args.db)
+    try:
+        pack = _build_pack(conn, args.session_id, redact=not args.no_redact)
+    except ValueError as e:
+        conn.close()
+        print(str(e), file=sys.stderr)
+        return 2
+    conn.close()
+
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json, out_md = _session_pack_paths(args.session_id, out_dir)
+    out_json.write_text(json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_md.write_text(_pack_to_markdown(pack), encoding="utf-8")
+
+    if args.method == "file":
+        print(str(out_md))
+        return 0
+
+    if args.method == "gist":
+        if not _have_gh():
+            print("gh not found; falling back to local file", file=sys.stderr)
+            print(str(out_md))
+            return 0
+        if not _gh_authed():
+            print("gh not authenticated; run `gh auth login` then retry. Falling back to local file.", file=sys.stderr)
+            print(str(out_md))
+            return 0
+
+        title = args.title or f"codex-session-{args.session_id}"
+        res = subprocess.run(
+            ["gh", "gist", "create", "--private", "--desc", title, str(out_md)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if res.returncode != 0:
+            print(res.stderr.strip() or "failed to create gist", file=sys.stderr)
+            print(str(out_md))
+            return 2
+        url = (res.stdout or "").strip()
+        if url:
+            _copy_to_clipboard(url)
+            print(url)
+            return 0
+        print(str(out_md))
+        return 0
+
+    print("unknown share method", file=sys.stderr)
+    return 2
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    p = Path(args.path).expanduser()
+    if not p.exists():
+        print("file not found", file=sys.stderr)
+        return 2
+    if p.suffix.lower() == ".json":
+        pack = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    else:
+        # Treat as markdown; use whole file as context.
+        pack = {"session_id": "imported", "cwd": "", "content": p.read_text(encoding="utf-8", errors="replace")}
+
+    content_for_prompt = _truncate_for_prompt(pack.get("content", "") or "", args.max_chars)
+    prompt = (
+        "You are continuing work from an imported Codex session pack.\n"
+        f"Source: {p}\n\n"
+        "Use the transcript below as full context.\n\n"
+        "=== TRANSCRIPT (verbatim) ===\n"
+        f"{content_for_prompt}\n"
+        "=== END TRANSCRIPT ===\n"
+    )
+    if args.user_prompt:
+        prompt = prompt + "\nUser request:\n" + args.user_prompt.strip() + "\n"
+
+    cmd = ["codex"]
+    if args.cd and isinstance(pack.get("cwd"), str) and pack.get("cwd") and Path(pack["cwd"]).exists():
+        cmd += ["-C", pack["cwd"]]
+    cmd.append(prompt)
+    os.execvp("codex", cmd)
+    return 1
+
 def _truncate(s: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -935,7 +1176,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
             list_bottom = height - 2
             list_h = max(1, list_bottom - list_top)
 
-            help_line = "Enter resume | Tab focus | / query focus | ↑/↓ PgUp/PgDn navigate | x pin | t tags | n note | f repo | d cwd | F tag | P pinned | g group | y copy id | c copy cmd | o open jsonl | R reindex | Esc clear | q quit"
+            help_line = "Enter resume | Tab focus | / query focus | ↑/↓ PgUp/PgDn | x pin | t tags | n note | f repo | d cwd | F tag | P pinned | g group | y id | c cmd | o open | S share | K fork | R reindex | Esc clear | q quit"
             stdscr.addstr(0, 0, _truncate(help_line, width - 1))
 
             prompt = f"Query({focus}): "
@@ -1113,6 +1354,12 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 status_msg = "no file_path"
                 continue
 
+            if k == ord("K") and sid:
+                return f"__FORK__ {sid}"
+
+            if k == ord("S") and sid:
+                return f"__SHARE__ {sid}"
+
             if k == ord("x") and sid:
                 new_val = 0 if rows[idx].pinned else 1
                 _set_user_field(sid, "pinned", new_val)
@@ -1273,6 +1520,28 @@ def cmd_live(args: argparse.Namespace) -> int:
         os.execvp(editor, [editor, path])
         return 1
 
+    if selected.startswith("__FORK__ "):
+        session_id = selected.split(" ", 1)[1].strip()
+        os.execvp(
+            "python3",
+            [
+                "python3",
+                str(Path(__file__).resolve()),
+                "fork",
+                session_id,
+                "--cd",
+            ],
+        )
+        return 1
+
+    if selected.startswith("__SHARE__ "):
+        session_id = selected.split(" ", 1)[1].strip()
+        method = "file"
+        if _have_gh() and _gh_authed():
+            method = "gist"
+        os.execvp("python3", ["python3", str(Path(__file__).resolve()), "share", session_id, "--method", method])
+        return 1
+
     print(selected)
     return 0
 
@@ -1389,6 +1658,37 @@ def main(argv: list[str]) -> int:
     p_export.add_argument("--out", help="Output path (defaults to stdout).")
     p_export.add_argument("--redact", action="store_true", help="Best-effort redaction of obvious secrets/paths.")
     p_export.set_defaults(func=cmd_export)
+
+    p_fork = sub.add_parser("fork", help="Fork a session into a new Codex session (private full context).")
+    p_fork.add_argument("session_id")
+    p_fork.add_argument("--codex-dir", type=Path, default=default_codex_dir)
+    p_fork.add_argument("--db", type=Path, default=default_db)
+    p_fork.add_argument("--out-dir", default=str(Path.home() / ".codex-user" / "forks"))
+    p_fork.add_argument("--max-chars", type=int, default=200_000, help="Max transcript chars to include in prompt.")
+    p_fork.add_argument("--cd", action="store_true", help="If session cwd exists, start Codex in that directory.")
+    p_fork.add_argument("--no-index", action="store_true")
+    p_fork.add_argument("--reindex", action="store_true")
+    p_fork.add_argument("user_prompt", nargs="?", help="Optional prompt to start the fork.")
+    p_fork.set_defaults(func=cmd_fork)
+
+    p_share = sub.add_parser("share", help="Share a session pack (local file or private Gist).")
+    p_share.add_argument("session_id")
+    p_share.add_argument("--codex-dir", type=Path, default=default_codex_dir)
+    p_share.add_argument("--db", type=Path, default=default_db)
+    p_share.add_argument("--out-dir", default=str(Path.home() / ".codex-user" / "shares"))
+    p_share.add_argument("--method", choices=["file", "gist"], default="file")
+    p_share.add_argument("--title", help="Gist description/title.")
+    p_share.add_argument("--no-redact", action="store_true", help="Disable redaction (NOT recommended for sharing).")
+    p_share.add_argument("--no-index", action="store_true")
+    p_share.add_argument("--reindex", action="store_true")
+    p_share.set_defaults(func=cmd_share)
+
+    p_import = sub.add_parser("import", help="Import a session pack and start a new Codex session with that context.")
+    p_import.add_argument("path")
+    p_import.add_argument("--max-chars", type=int, default=200_000)
+    p_import.add_argument("--cd", action="store_true", help="If pack has a cwd that exists, start Codex in that directory.")
+    p_import.add_argument("user_prompt", nargs="?", help="Optional prompt to start after import.")
+    p_import.set_defaults(func=cmd_import)
 
     args = p.parse_args(argv)
     return int(args.func(args) or 0)

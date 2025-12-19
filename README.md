@@ -58,6 +58,11 @@ Uninstall:
 - Plain output (no UI): `codex_sessions_search "query" --no-ui --limit 20`
 - Browse most recent (no query): `codex_sessions_search --all`
 - Export a session: `python3 ~/.codex-user/codex_sessions.py export <SESSION_ID> --out session.md --redact`
+ - Fork a session into a new Codex session (private, full context): `python3 ~/.codex-user/codex_sessions.py fork <SESSION_ID> --cd`
+ - Share a session pack (redacted by default):
+   - Local file: `python3 ~/.codex-user/codex_sessions.py share <SESSION_ID> --method file`
+   - Private Gist: `python3 ~/.codex-user/codex_sessions.py share <SESSION_ID> --method gist`
+ - Import a shared pack and start a new Codex session: `python3 ~/.codex-user/codex_sessions.py import ./codex-session-<ID>.md --cd`
 
 ### Quick start (npx)
 - `npx codex-sessions` then type a query, press Enter to resume.
@@ -68,13 +73,17 @@ Uninstall:
 - Resume: `Enter`
 - Organize: `x` pin/unpin, `t` tags, `n` note, `g` group similar titles
 - Filter: `f` repo, `d` cwd, `F` tag, `P` pinned‑only
-- Actions: `y` copy id, `c` copy resume command, `o` open session JSONL in `$EDITOR`, `R` force reindex
+- Actions: `y` copy id, `c` copy resume command, `o` open session JSONL in `$EDITOR`, `K` fork, `S` share, `R` force reindex
 - Quit: `q`
 
 ## Data & privacy
 - Index DB is stored locally (default: `~/.codex-user/codex_sessions.db`)
 - The DB contains plain-text excerpts from your Codex sessions; do not commit or share it.
 - Pins/tags/notes are also stored locally in the same DB.
+
+### Fork vs share
+- **Fork** starts a *new* Codex session with the original transcript as context (private, full context).
+- **Share** creates a portable “session pack” and defaults to redacting obvious secrets; you can share it as a local file or a private GitHub Gist.
 
 ## FAQ
 ### Does this upload my sessions anywhere?
