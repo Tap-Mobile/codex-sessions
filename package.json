@@ -13,7 +13,9 @@
   },
   "bin": {
     "codex-sessions": "npm-bin/codex-sessions.js",
-    "codex_sessions": "npm-bin/codex-sessions.js"
+    "codex_sessions": "npm-bin/codex-sessions.js",
+    "codex-agents": "bin/codex_agents",
+    "codex_agents": "bin/codex_agents"
   },
   "files": [
     "codex_sessions.py",
@@ -27,4 +29,3 @@
     "node": ">=18"
   }
 }
-

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+codex_agents: tmux-based multi-agent runner for Codex CLI
+
+Usage:
+  codex_agents start [--session NAME] [--agents N] [--cd DIR] [--log-dir DIR] [--codex-cmd CMD]
+  codex_agents attach [--session NAME]
+  codex_agents send <agentN|window-name> "<task text>"
+  codex_agents status [--session NAME]
+  codex_agents stop [--session NAME]
+
+Defaults:
+  --session    codex-agents
+  --agents     3
+  --cd         (none)
+  --log-dir    ~/.codex-user/agents/logs
+  --codex-cmd  codex
+
+Notes:
+  - Requires tmux.
+  - Each agent runs in its own tmux window: agent1, agent2, ...
+  - Logs are appended per-agent in log-dir.
+EOF
+}
+
+require() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing dependency: $1" >&2
+    exit 2
+  fi
+}
+
+SESSION="codex-agents"
+AGENTS=3
+CD_DIR=""
+LOG_DIR="${HOME}/.codex-user/agents/logs"
+CODEX_CMD="codex"
+
+cmd="${1:-}"
+shift || true
+
+case "${cmd:-}" in
+  -h|--help|"")
+    usage
+    exit 0
+    ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --session) SESSION="$2"; shift 2;;
+    --agents) AGENTS="$2"; shift 2;;
+    --cd) CD_DIR="$2"; shift 2;;
+    --log-dir) LOG_DIR="$2"; shift 2;;
+    --codex-cmd) CODEX_CMD="$2"; shift 2;;
+    --) shift; break;;
+    *) break;;
+  esac
+done
+
+case "${cmd}" in
+  start)
+    require tmux
+    mkdir -p "$LOG_DIR"
+
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "session already exists: $SESSION" >&2
+      exit 2
+    fi
+
+    # Manager window.
+    tmux new-session -d -s "$SESSION" -n manager
+    tmux set-option -t "$SESSION" -g remain-on-exit on >/dev/null
+    tmux set-option -t "$SESSION" -g history-limit 200000 >/dev/null
+    tmux set-option -t "$SESSION" -g mouse on >/dev/null || true
+
+    tmux send-keys -t "$SESSION:manager" "echo 'codex_agents started. Use: codex_agents send agent1 \"...\"' " C-m
+    tmux send-keys -t "$SESSION:manager" "echo 'Attach: codex_agents attach' " C-m
+    tmux send-keys -t "$SESSION:manager" "echo 'Status: codex_agents status' " C-m
+
+    for i in $(seq 1 "$AGENTS"); do
+      w="agent${i}"
+      tmux new-window -t "$SESSION" -n "$w"
+
+      log_file="${LOG_DIR}/${SESSION}-${w}.log"
+      tmux pipe-pane -o -t "$SESSION:$w" "cat >> \"${log_file}\""
+
+      launch="$CODEX_CMD"
+      if [[ -n "$CD_DIR" ]]; then
+        launch="$CODEX_CMD -C \"${CD_DIR}\""
+      fi
+
+      # Start the agent.
+      tmux send-keys -t "$SESSION:$w" "echo \"[${w}] log: ${log_file}\"" C-m
+      tmux send-keys -t "$SESSION:$w" "$launch" C-m
+    done
+
+    tmux select-window -t "$SESSION:manager"
+    echo "started tmux session: $SESSION"
+    echo "logs: $LOG_DIR"
+    ;;
+
+  attach)
+    require tmux
+    tmux attach -t "$SESSION"
+    ;;
+
+  send)
+    require tmux
+    target="${1:-}"
+    task="${2:-}"
+    if [[ -z "$target" || -z "$task" ]]; then
+      usage >&2
+      exit 2
+    fi
+    tmux send-keys -t "$SESSION:$target" "$task" C-m
+    ;;
+
+  status)
+    require tmux
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "no such session: $SESSION" >&2
+      exit 2
+    fi
+    tmux list-windows -t "$SESSION"
+    ;;
+
+  stop)
+    require tmux
+    tmux kill-session -t "$SESSION"
+    echo "stopped: $SESSION"
+    ;;
+
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+

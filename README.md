@@ -37,6 +37,8 @@ Installs a `codex-sessions` (and `codex_sessions`) command:
 Uninstall:
 - `npm uninstall -g codex-sessions`
 
+This also installs `codex-agents` / `codex_agents` (tmux multi-agent runner).
+
 ### Option C: manual install (macOS / zsh)
 1) Copy files:
 - `mkdir -p ~/.codex-user ~/.local/bin`
@@ -66,6 +68,31 @@ Uninstall:
 
 ### Quick start (npx)
 - `npx codex-sessions` then type a query, press Enter to resume.
+
+## Multi-agent (tmux)
+If you want a “manager + sub-agents” workflow (each agent in its own tmux window), use `codex-agents`.
+
+### Start 3 agents
+```bash
+codex-agents start --agents 3
+codex-agents attach
+```
+
+### Start agents in a repo directory
+```bash
+codex-agents start --agents 3 --cd ~/github/Tap-Mobile/photoboost-android
+```
+
+### Send a task to an agent window
+```bash
+codex-agents send agent1 "Task: …"
+```
+
+### Check status / stop
+```bash
+codex-agents status
+codex-agents stop
+```
 
 ## Keybindings (live UI)
 - Search: type; `Tab` toggles focus query/list; `Esc` clears query
