@@ -65,7 +65,7 @@ USING fts5(
 """
 
 SCHEMA_VERSION = 4
-PARSER_VERSION = 4
+PARSER_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -118,10 +118,21 @@ def _strip_boilerplate(text: str) -> str:
     s = re.sub(r"<user_instructions>.*?</user_instructions>", "", s, flags=re.IGNORECASE | re.DOTALL)
     s = re.sub(r"<instructions>.*?</instructions>", "", s, flags=re.IGNORECASE | re.DOTALL)
     s = re.sub(r"^#\s*AGENTS\.md.*$", "", s, flags=re.IGNORECASE | re.MULTILINE)
-    s = re.sub(r"\\n{3,}", "\n\n", s)
-    s = s.strip()
-    s = " ".join(s.split())
+    s = s.replace("\r", "")
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    # Preserve newlines for preview; FTS doesn't need whitespace collapsing.
+    s = "\n".join(line.rstrip() for line in s.splitlines()).strip()
     return s
+
+
+def _maybe_parse_json_dict(s: object) -> Optional[dict]:
+    if not isinstance(s, str):
+        return None
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
@@ -132,6 +143,7 @@ def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
 
     updated_at: Optional[int] = None
     messages: list[tuple[str, str]] = []
+    tool_name_by_call_id: dict[str, str] = {}
 
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -167,23 +179,84 @@ def parse_codex_session_file(path: Path) -> Optional[SessionDoc]:
                 if typ != "response_item":
                     continue
 
-                if payload.get("type") != "message":
-                    continue
+                payload_type = payload.get("type")
 
-                role = payload.get("role")
-                if role not in ("user", "assistant", "system"):
-                    continue
+                if payload_type == "message":
+                    role = payload.get("role")
+                    # Index the actual conversation, not Codex's internal prompts.
+                    if role not in ("user", "assistant"):
+                        continue
 
-                text = _extract_text_from_message_payload(payload)
-                if not text:
-                    continue
-
-                if role == "user":
-                    text = _strip_boilerplate(text)
+                    text = _extract_text_from_message_payload(payload)
                     if not text:
                         continue
 
-                messages.append((role, text))
+                    # Strip common boilerplate in user messages (AGENTS, environment context, etc.).
+                    if role == "user":
+                        text = _strip_boilerplate(text)
+                        if not text:
+                            continue
+
+                    messages.append((role, text))
+                    continue
+
+                # Newer Codex logs record tool activity as standalone response items.
+                if payload_type == "function_call":
+                    name = payload.get("name") if isinstance(payload.get("name"), str) else ""
+                    call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else ""
+                    args = payload.get("arguments")
+                    args_dict = _maybe_parse_json_dict(args)
+                    if call_id and name:
+                        tool_name_by_call_id[call_id] = name
+
+                    tool_text = ""
+                    if args_dict and name == "exec_command":
+                        cmd = args_dict.get("cmd")
+                        if isinstance(cmd, str) and cmd.strip():
+                            tool_text = cmd.strip()
+                    if not tool_text:
+                        tool_text = args if isinstance(args, str) else (json.dumps(args_dict) if args_dict else "")
+                    if tool_text:
+                        messages.append((f"tool_call {name or 'unknown'}", tool_text))
+                    continue
+
+                if payload_type == "function_call_output":
+                    call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else ""
+                    name = tool_name_by_call_id.get(call_id, "")
+                    out = payload.get("output")
+                    out_text = out if isinstance(out, str) else ""
+                    if out_text:
+                        label = f"tool_output {name}" if name else "tool_output"
+                        messages.append((label, out_text))
+                    continue
+
+                # Custom tools (e.g., apply_patch) are stored separately.
+                if payload_type == "custom_tool_call":
+                    name = payload.get("name") if isinstance(payload.get("name"), str) else ""
+                    call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else ""
+                    inp = payload.get("input")
+                    if call_id and name:
+                        tool_name_by_call_id[call_id] = name
+                    inp_text = inp if isinstance(inp, str) else ""
+                    if inp_text:
+                        messages.append((f"tool_call {name or 'unknown'}", inp_text))
+                    continue
+
+                if payload_type == "custom_tool_call_output":
+                    call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else ""
+                    name = tool_name_by_call_id.get(call_id, "")
+                    out = payload.get("output")
+                    out_text = ""
+                    if isinstance(out, str):
+                        out_dict = _maybe_parse_json_dict(out)
+                        if out_dict and isinstance(out_dict.get("output"), str):
+                            out_text = out_dict["output"]
+                        else:
+                            out_text = out
+                    if out_text:
+                        label = f"tool_output {name}" if name else "tool_output"
+                        messages.append((label, out_text))
+                    continue
 
     except FileNotFoundError:
         return None
@@ -502,7 +575,7 @@ def search_sessions(db_path: Path, query: str, limit: int, now: Optional[int] = 
           s.updated_at,
           COALESCE(s.cwd, '') AS cwd,
           COALESCE(s.title, '') AS title,
-          snippet(session_fts, 1, '[', ']', '…', 14) AS snippet,
+          snippet(session_fts, 1, '[', ']', '…', 28) AS snippet,
           (bm25(session_fts) + ((? - s.updated_at) / 86400.0) * ?) AS score,
           COALESCE(u.pinned, 0) AS pinned,
           COALESCE(u.tags, '') AS tags,
@@ -597,17 +670,25 @@ def list_sessions(db_path: Path, limit: int) -> list[SearchRow]:
     return out
 
 
-def _escape_fts_token(token: str) -> str:
-    token = token.replace('"', '""')
-    return f'"{token}"'
-
-
 def build_prefix_query(user_query: str) -> str:
-    tokens = [t for t in user_query.strip().split() if t.strip()]
+    # Extract "words" so queries like "TaskModal.tsx" and "/path/to/foo-bar"
+    # are searchable without requiring FTS syntax.
+    tokens = re.findall(r"[A-Za-z0-9_]+", user_query or "")
     if not tokens:
         return ""
     # Prefix-match every term for "live search while typing".
-    return " ".join(f"{_escape_fts_token(t)}*" for t in tokens)
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tokens:
+        if not t:
+            continue
+        is_kw = t.upper() in ("AND", "OR", "NOT", "NEAR")
+        term = f'"{t}"' if is_kw else t
+        if term in seen:
+            continue
+        seen.add(term)
+        out.append(f"{term}*" if not is_kw else term)
+    return " ".join(out)
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -730,6 +811,71 @@ def _truncate_for_prompt(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[-max_chars:]
+
+
+def _preview_build_render_lines(
+    raw_lines: list[str], *, width: int, wrap: bool, x_offset: int
+) -> tuple[list[str], list[int]]:
+    """
+    Build a render buffer for the preview pane.
+
+    Returns:
+      - rendered_lines: list of lines already wrapped/truncated/panned to width
+      - raw_to_render: mapping of raw line index -> starting rendered line index
+    """
+    w = max(1, int(width))
+    x = max(0, int(x_offset))
+
+    rendered: list[str] = []
+    raw_to_render: list[int] = []
+
+    for line in raw_lines:
+        raw_to_render.append(len(rendered))
+        s = (line or "").replace("\r", "")
+        if wrap:
+            # For wrap mode we ignore horizontal panning; it doesn't compose well.
+            if not s:
+                rendered.append("")
+                continue
+            for i in range(0, len(s), w):
+                rendered.append(s[i : i + w])
+            continue
+
+        if x:
+            s = s[x:]
+        rendered.append(s[:w])
+
+    return rendered, raw_to_render
+
+
+def _preview_find_matches(lines: list[str], terms: list[str]) -> list[tuple[int, int]]:
+    """
+    Return raw-line match locations sorted by "best" match:
+      - lines matching more terms first
+      - then earlier lines
+      - then earlier column
+    """
+    ts = [t.lower() for t in (terms or []) if isinstance(t, str) and t.strip()]
+    if not ts:
+        return []
+
+    out: list[tuple[int, int, int]] = []
+    for i, line in enumerate(lines):
+        s = (line or "").lower()
+        hits = 0
+        first_col: Optional[int] = None
+        for t in ts:
+            pos = s.find(t)
+            if pos == -1:
+                continue
+            hits += 1
+            if first_col is None or pos < first_col:
+                first_col = pos
+        if hits:
+            out.append((i, int(first_col or 0), hits))
+
+    out.sort(key=lambda x: (-x[2], x[0], x[1]))
+    return [(i, col) for (i, col, _hits) in out]
 
 
 def cmd_fork(args: argparse.Namespace) -> int:
@@ -1120,7 +1266,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
         query = initial_query or ""
         cursor = len(query)
-        focus = "query"  # or "list"
+        focus = "query"  # "query" | "list" | "preview"
 
         filter_repo = ""
         filter_cwd = ""
@@ -1134,6 +1280,21 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
         detail_cache: dict[str, dict] = {}
         status_msg = ""
         preview_tail = True
+        preview_wrap = False
+        preview_x_offset = 0
+        preview_y_offset = 0
+        preview_match_idx = 0
+
+        preview_cached_sid = ""
+        preview_cached_terms: tuple[str, ...] = ()
+        preview_cached_width = 0
+        preview_cached_wrap = preview_wrap
+        preview_cached_x = preview_x_offset
+        preview_raw_lines: list[str] = []
+        preview_render_lines: list[str] = []
+        preview_raw_to_render: list[int] = []
+        preview_matches_raw: list[tuple[int, int]] = []
+        preview_matches_render: list[int] = []
 
         def _clamp():
             nonlocal idx, offset
@@ -1157,6 +1318,103 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 return ""
             return rows[idx].session_id
 
+        def _query_terms() -> tuple[str, ...]:
+            # Keep it simple and predictable: extract "word" tokens.
+            raw = re.findall(r"[A-Za-z0-9_]+", query or "")
+            seen: set[str] = set()
+            out: list[str] = []
+            for t in raw:
+                if len(t) < 2:
+                    continue
+                key = t.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(t)
+            return tuple(out)
+
+        def _preview_ensure(detail: dict, preview_w: int, preview_h: int) -> None:
+            nonlocal preview_cached_sid
+            nonlocal preview_cached_terms
+            nonlocal preview_cached_width
+            nonlocal preview_cached_wrap
+            nonlocal preview_cached_x
+            nonlocal preview_raw_lines
+            nonlocal preview_render_lines
+            nonlocal preview_raw_to_render
+            nonlocal preview_matches_raw
+            nonlocal preview_matches_render
+            nonlocal preview_match_idx
+            nonlocal preview_y_offset
+
+            sid = _selected_id()
+            if not sid:
+                preview_cached_sid = ""
+                preview_cached_terms = ()
+                preview_raw_lines = []
+                preview_render_lines = []
+                preview_raw_to_render = []
+                preview_matches_raw = []
+                preview_matches_render = []
+                preview_match_idx = 0
+                preview_y_offset = 0
+                return
+
+            terms = _query_terms()
+            sid_changed = sid != preview_cached_sid
+            terms_changed = terms != preview_cached_terms
+
+            if sid_changed or not preview_raw_lines:
+                content = detail.get("content", "") or ""
+                preview_raw_lines = content.splitlines()
+
+            need_render_rebuild = (
+                sid_changed
+                or not preview_render_lines
+                or int(preview_w) != int(preview_cached_width)
+                or bool(preview_wrap) != bool(preview_cached_wrap)
+                or int(preview_x_offset) != int(preview_cached_x)
+            )
+            if need_render_rebuild:
+                preview_render_lines, preview_raw_to_render = _preview_build_render_lines(
+                    preview_raw_lines,
+                    width=max(1, int(preview_w)),
+                    wrap=bool(preview_wrap),
+                    x_offset=int(preview_x_offset),
+                )
+                preview_cached_width = int(preview_w)
+                preview_cached_wrap = bool(preview_wrap)
+                preview_cached_x = int(preview_x_offset)
+
+            if sid_changed or terms_changed or need_render_rebuild:
+                preview_matches_raw = _preview_find_matches(preview_raw_lines, list(terms))
+                preview_matches_render = [
+                    preview_raw_to_render[i]
+                    for (i, _col) in preview_matches_raw
+                    if 0 <= i < len(preview_raw_to_render)
+                ]
+
+            if sid_changed or terms_changed:
+                preview_match_idx = 0
+                if terms and preview_matches_render:
+                    preview_y_offset = max(0, int(preview_matches_render[0]) - 2)
+                else:
+                    if preview_tail:
+                        preview_y_offset = max(0, len(preview_render_lines) - max(1, int(preview_h)))
+                    else:
+                        preview_y_offset = 0
+
+            max_y = max(0, len(preview_render_lines) - max(1, int(preview_h)))
+            preview_y_offset = max(0, min(int(preview_y_offset), int(max_y)))
+
+            if preview_matches_render:
+                preview_match_idx = max(0, min(int(preview_match_idx), len(preview_matches_render) - 1))
+            else:
+                preview_match_idx = 0
+
+            preview_cached_sid = sid
+            preview_cached_terms = terms
+
         _clamp()
 
         while True:
@@ -1176,7 +1434,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
             list_bottom = height - 2
             list_h = max(1, list_bottom - list_top)
 
-            help_line = "Enter resume | Tab focus | / query focus | ↑/↓ PgUp/PgDn | x pin | t tags | n note | f repo | d cwd | F tag | P pinned | g group | y id | c cmd | o open | S share | K fork | R reindex | Esc clear | q quit"
+            help_line = "Enter resume | Tab focus q/l/p | / query | arrows/Pg: list or preview | x pin | t tags | m note | f repo | d cwd | F tag | P pinned | g group | n/N hit | w wrap | v tail | y id | c cmd | o open | S share | K fork | R reindex | Esc clear | q quit"
             stdscr.addstr(0, 0, _truncate(help_line, width - 1))
 
             prompt = f"Query({focus}): "
@@ -1204,7 +1462,8 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 indexed_at_h = _fmt_ts(int(indexed_at))
             except Exception:
                 indexed_at_h = "?"
-            status = f"{idx_info} | {filt} | indexed {indexed_at_h}"
+            status_base = f"{idx_info} | {filt} | indexed {indexed_at_h}"
+            status = status_base
             if status_msg:
                 status = status + f" | {status_msg}"
             stdscr.addstr(2, 0, _truncate(status, width - 1))
@@ -1245,10 +1504,12 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 detail = detail_cache.get(sid) or {}
 
             rx = left_w + 1
-            stdscr.addstr(3, rx, _truncate("PREVIEW", right_w - 1))
-            stdscr.addstr(4, rx, _truncate("-" * (right_w - 1), right_w - 1))
+            preview_w = max(1, right_w - 1)
+            preview_label = "PREVIEW" if focus != "preview" else "PREVIEW*"
+            stdscr.addstr(3, rx, _truncate(preview_label, preview_w))
+            stdscr.addstr(4, rx, _truncate("-" * preview_w, preview_w))
             if not detail:
-                stdscr.addstr(5, rx, _truncate("(no selection)", right_w - 1))
+                stdscr.addstr(5, rx, _truncate("(no selection)", preview_w))
             else:
                 meta_lines = [
                     f"id: {detail.get('session_id','')}",
@@ -1262,28 +1523,49 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 for ml in meta_lines:
                     if y >= height - 2:
                         break
-                    for wline in _wrap(ml, right_w - 1):
+                    for wline in _wrap(ml, preview_w):
                         if y >= height - 2:
                             break
-                        stdscr.addstr(y, rx, _truncate(wline, right_w - 1))
+                        stdscr.addstr(y, rx, _truncate(wline, preview_w))
                         y += 1
 
                 if y < height - 2:
-                    stdscr.addstr(y, rx, _truncate("-" * (right_w - 1), right_w - 1))
+                    stdscr.addstr(y, rx, _truncate("-" * preview_w, preview_w))
                     y += 1
 
-                content = detail.get("content", "") or ""
-                content_lines = content.splitlines()
-                if preview_tail and len(content_lines) > 120:
-                    content_lines = content_lines[-120:]
-                for line in content_lines:
-                    if y >= height - 2:
+                preview_h = max(1, (height - 2) - y)
+                _preview_ensure(detail, preview_w, preview_h)
+
+                # Redraw status line with preview info (computed after ensure).
+                preview_bits: list[str] = []
+                preview_bits.append("wrap" if preview_wrap else "nowrap")
+                if not preview_wrap and preview_x_offset:
+                    preview_bits.append(f"x{preview_x_offset}")
+                if preview_cached_terms:
+                    if preview_matches_render:
+                        preview_bits.append(f"hits {preview_match_idx+1}/{len(preview_matches_render)}")
+                    else:
+                        preview_bits.append("hits 0")
+                status2 = status_base + (" | preview " + " ".join(preview_bits) if preview_bits else "")
+                if status_msg:
+                    status2 = status2 + f" | {status_msg}"
+                stdscr.addstr(2, 0, _truncate(status2, width - 1))
+
+                cur_hit = -1
+                if preview_matches_render:
+                    try:
+                        cur_hit = int(preview_matches_render[preview_match_idx])
+                    except Exception:
+                        cur_hit = -1
+
+                start = int(preview_y_offset)
+                end = min(len(preview_render_lines), start + preview_h)
+                for i, line in enumerate(preview_render_lines[start:end]):
+                    yy = y + i
+                    if yy >= height - 2:
                         break
-                    for wline in _wrap(line, right_w - 1):
-                        if y >= height - 2:
-                            break
-                        stdscr.addstr(y, rx, _truncate(wline, right_w - 1))
-                        y += 1
+                    attr = curses.A_BOLD if (start + i) == cur_hit else 0
+                    stdscr.addstr(yy, rx, _truncate(line, preview_w), attr)
 
             stdscr.refresh()
             k = stdscr.getch()
@@ -1297,46 +1579,153 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 _refresh_rows(reset_selection=True)
                 continue
             if k in (9,):  # TAB
-                focus = "list" if focus == "query" else "query"
+                if focus == "query":
+                    focus = "list"
+                elif focus == "list":
+                    focus = "preview"
+                else:
+                    focus = "query"
                 continue
             if k in (ord("/"),):
                 focus = "query"
                 continue
 
-            if k in (curses.KEY_UP, ord("k"), 16):  # Ctrl-P
-                if rows:
-                    idx = max(0, idx - 1)
+            # Preview navigation only when focused.
+            if focus == "preview" and detail:
+                if k in (curses.KEY_UP, ord("k"), 16):  # Ctrl-P
+                    preview_y_offset = max(0, int(preview_y_offset) - 1)
+                    continue
+                if k in (curses.KEY_DOWN, ord("j"), 14):  # Ctrl-N
+                    preview_y_offset = int(preview_y_offset) + 1
+                    _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == curses.KEY_NPAGE:  # PgDn
+                    preview_y_offset = int(preview_y_offset) + int(preview_h)
+                    _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == curses.KEY_PPAGE:  # PgUp
+                    preview_y_offset = max(0, int(preview_y_offset) - int(preview_h))
+                    continue
+                if k == curses.KEY_HOME:
+                    preview_y_offset = 0
+                    continue
+                if k == curses.KEY_END:
+                    preview_y_offset = max(0, len(preview_render_lines) - int(preview_h))
+                    continue
+                if k == curses.KEY_LEFT:
+                    if not preview_wrap and preview_x_offset > 0:
+                        preview_x_offset = max(0, int(preview_x_offset) - 1)
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == curses.KEY_RIGHT:
+                    if not preview_wrap:
+                        preview_x_offset = int(preview_x_offset) + 1
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == ord("w"):
+                    preview_wrap = not preview_wrap
+                    if preview_wrap:
+                        preview_x_offset = 0
+                    _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == ord("n"):
+                    if preview_matches_render:
+                        preview_match_idx = (int(preview_match_idx) + 1) % len(preview_matches_render)
+                        preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == ord("N"):
+                    if preview_matches_render:
+                        preview_match_idx = (int(preview_match_idx) - 1) % len(preview_matches_render)
+                        preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == ord("v"):
+                    preview_tail = not preview_tail
+                    if preview_tail and not preview_cached_terms:
+                        preview_y_offset = max(0, len(preview_render_lines) - int(preview_h))
+                    continue
+
+            # List navigation (arrow keys always; vim/Ctrl keys only when not typing).
+            if focus != "preview":
+                if k in (curses.KEY_UP,):
+                    if rows:
+                        idx = max(0, idx - 1)
+                        _clamp()
+                    continue
+                if k in (curses.KEY_DOWN,):
+                    if rows:
+                        idx = min(len(rows) - 1, idx + 1)
+                        _clamp()
+                    continue
+                if focus != "query" and k in (ord("k"), 16):  # Ctrl-P
+                    if rows:
+                        idx = max(0, idx - 1)
+                        _clamp()
+                    continue
+                if focus != "query" and k in (ord("j"), 14):  # Ctrl-N
+                    if rows:
+                        idx = min(len(rows) - 1, idx + 1)
+                        _clamp()
+                    continue
+                if k == curses.KEY_NPAGE:  # PgDn
+                    if rows:
+                        idx = min(len(rows) - 1, idx + visible)
+                        _clamp()
+                    continue
+                if k == curses.KEY_PPAGE:  # PgUp
+                    if rows:
+                        idx = max(0, idx - visible)
+                        _clamp()
+                    continue
+                if k == curses.KEY_HOME:
+                    idx = 0
+                    offset = 0
+                    continue
+                if k == curses.KEY_END and rows:
+                    idx = len(rows) - 1
                     _clamp()
-                continue
-            if k in (curses.KEY_DOWN, ord("j"), 14):  # Ctrl-N
-                if rows:
-                    idx = min(len(rows) - 1, idx + 1)
-                    _clamp()
-                continue
-            if k == curses.KEY_NPAGE:  # PgDn
-                if rows:
-                    idx = min(len(rows) - 1, idx + visible)
-                    _clamp()
-                continue
-            if k == curses.KEY_PPAGE:  # PgUp
-                if rows:
-                    idx = max(0, idx - visible)
-                    _clamp()
-                continue
-            if k == curses.KEY_HOME:
-                idx = 0
-                offset = 0
-                continue
-            if k == curses.KEY_END and rows:
-                idx = len(rows) - 1
-                _clamp()
-                continue
+                    continue
 
             sid = _selected_id()
             if k in (curses.KEY_ENTER, 10, 13):
                 if sid:
                     return f"__RESUME__ {sid}"
                 continue
+
+            # Query edit/typing takes precedence over action hotkeys.
+            if focus == "query":
+                if k in (curses.KEY_LEFT,):
+                    cursor = max(0, cursor - 1)
+                    continue
+                if k in (curses.KEY_RIGHT,):
+                    cursor = min(len(query), cursor + 1)
+                    continue
+                if k in (curses.KEY_BACKSPACE, 127, 8):
+                    if cursor > 0:
+                        query = query[: cursor - 1] + query[cursor:]
+                        cursor -= 1
+                        _refresh_rows(reset_selection=True)
+                    continue
+                if k == curses.KEY_DC:
+                    if cursor < len(query):
+                        query = query[:cursor] + query[cursor + 1 :]
+                        _refresh_rows(reset_selection=True)
+                    continue
+                if k in (21,):  # Ctrl-U
+                    query = ""
+                    cursor = 0
+                    _refresh_rows(reset_selection=True)
+                    continue
+                if 32 <= k <= 126:
+                    ch = chr(k)
+                    query = query[:cursor] + ch + query[cursor:]
+                    cursor += 1
+                    _refresh_rows(reset_selection=True)
+                    continue
+                continue
+
+            # From here down: focus is list/preview, so action hotkeys are active.
             if k == ord("y") and sid:
                 _copy_to_clipboard(sid)
                 status_msg = "copied id"
@@ -1376,7 +1765,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                     detail_cache.pop(sid, None)
                     _refresh_rows()
                 continue
-            if k == ord("n") and sid:
+            if k == ord("m") and sid:
                 current_note = (detail or {}).get("note", "") if detail else rows[idx].note
                 new_note = _prompt(stdscr, "note: ", current_note)
                 if new_note is not None:
@@ -1412,42 +1801,26 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 _refresh_rows(reset_selection=True)
                 status_msg = "reindexed"
                 continue
-
             if k == ord("v"):
                 preview_tail = not preview_tail
+                if preview_tail and detail and not preview_cached_terms:
+                    preview_y_offset = max(0, len(preview_render_lines) - int(preview_h))
                 continue
 
-            if focus == "query":
-                if k in (curses.KEY_LEFT,):
-                    cursor = max(0, cursor - 1)
-                    continue
-                if k in (curses.KEY_RIGHT,):
-                    cursor = min(len(query), cursor + 1)
-                    continue
-                if k in (curses.KEY_BACKSPACE, 127, 8):
-                    if cursor > 0:
-                        query = query[: cursor - 1] + query[cursor:]
-                        cursor -= 1
-                        _refresh_rows(reset_selection=True)
-                    continue
-                if k == curses.KEY_DC:
-                    if cursor < len(query):
-                        query = query[:cursor] + query[cursor + 1 :]
-                        _refresh_rows(reset_selection=True)
-                    continue
-                if k in (21,):  # Ctrl-U
-                    query = ""
-                    cursor = 0
-                    _refresh_rows(reset_selection=True)
-                    continue
-                if 32 <= k <= 126:
-                    ch = chr(k)
-                    query = query[:cursor] + ch + query[cursor:]
-                    cursor += 1
-                    _refresh_rows(reset_selection=True)
-                    continue
+            if k == ord("n"):
+                if detail and preview_matches_render:
+                    preview_match_idx = (int(preview_match_idx) + 1) % len(preview_matches_render)
+                    preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
+                    _preview_ensure(detail, preview_w, preview_h)
+                continue
+            if k == ord("N"):
+                if detail and preview_matches_render:
+                    preview_match_idx = (int(preview_match_idx) - 1) % len(preview_matches_render)
+                    preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
+                    _preview_ensure(detail, preview_w, preview_h)
+                continue
 
-            # When focus=list, ignore typing.
+            # When focus=list/preview, ignore typing.
 
     selected = curses.wrapper(_ui)
     conn.close()

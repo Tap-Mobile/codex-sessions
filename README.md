@@ -40,8 +40,9 @@ If this saves you time, star the repo so others can find it.
 
 ## What it does
 - Indexes your local Codex session logs from `~/.codex/sessions/**/*.jsonl`
+- Indexes messages + tool calls + tool outputs (so you can search for commands, paths, errors, etc.)
 - Full‑text search via SQLite FTS5 (with recency bias)
-- 2‑pane TUI: searchable list + preview pane
+- 2‑pane TUI: searchable list + pannable preview pane
 - `Enter` resumes: runs `codex resume <session_id>`
 - Pin/tag/note + filters (repo/cwd/tag/pinned-only) + grouping
 
@@ -85,9 +86,12 @@ codex-agents stop
 ```
 
 ## Keybindings (live UI)
-- `Enter` resume, `Tab` focus query/list, `Esc` clear
-- `↑/↓` / `PgUp/PgDn` / `Home/End` navigate
-- `x` pin, `t` tags, `n` note, `g` group
+- `Enter` resume, `Tab` focus query/list/preview, `Esc` clear
+- `↑/↓` / `PgUp/PgDn` / `Home/End` navigate list (or scroll preview when preview is focused)
+- `←/→` pan preview horizontally (when wrap is off)
+- `n` / `N` next/prev hit in preview
+- `w` toggle preview wrap, `v` toggle preview tail mode
+- `x` pin, `t` tags, `m` note, `g` group
 - `f` repo filter, `d` cwd filter, `F` tag filter, `P` pinned-only
 - `y` copy id, `c` copy resume cmd, `o` open JSONL in `$EDITOR`
 - `K` fork, `S` share, `R` reindex, `q` quit
