@@ -103,7 +103,7 @@ codex-agents stop
 ```
 
 ## Keybindings (live UI)
-- Type to search (live, no Enter). `Backspace` deletes; `Ctrl+U` clears.
+- Type to search (live, no Enter). Search refresh is debounced; you'll see `search pending` while typing. `Backspace` deletes; `Ctrl+U` clears.
 - `Enter` resume selected session
 - `Tab` toggle focus `list` / `preview` (`↑/↓` / `PgUp/PgDn` / `Home/End` act on focused pane)
 - `←/→` pan preview horizontally (when wrap is off and preview is focused)
