@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW_BASE="https://raw.githubusercontent.com/Tap-Mobile/codex-sessions/main"
+# Allow overrides for local testing / private mirrors.
+REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/Tap-Mobile/codex-sessions/main}"
 
 say() {
   printf "%s\n" "$*"
@@ -153,7 +154,7 @@ EOF
   local start="# >>> codex-sessions resumev2 >>>"
   local end="# <<< codex-sessions resumev2 <<<"
   local block
-  block="$(cat <<'EOF'
+  IFS= read -r -d '' block <<'EOF' || true
 # Ensure ~/.local/bin is on PATH for wrapper scripts (codex_sessions).
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -211,7 +212,6 @@ codex() {
   command codex "$@"
 }
 EOF
-)"
 
   append_block_if_missing "$rc" "$start" "$end" "$block"
 
