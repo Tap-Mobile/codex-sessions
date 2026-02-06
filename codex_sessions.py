@@ -562,20 +562,29 @@ class SearchRow:
     repo_sha: str
 
 
-def search_sessions(db_path: Path, query: str, limit: int, now: Optional[int] = None) -> list[SearchRow]:
+def search_sessions(
+    db_path: Path,
+    query: str,
+    limit: int,
+    now: Optional[int] = None,
+    *,
+    include_snippet: bool = True,
+) -> list[SearchRow]:
     conn = connect_db(db_path)
     conn.row_factory = sqlite3.Row
     now_val = int(now or time.time())
     recency_weight = 0.15
+    # `snippet(...)` is expensive on large DBs; the live UI doesn't display it.
+    snippet_expr = "snippet(session_fts, 1, '[', ']', '…', 28)" if include_snippet else "''"
     rows = conn.execute(
-        """
+        f"""
         SELECT
           s.session_id,
           s.created_at,
           s.updated_at,
           COALESCE(s.cwd, '') AS cwd,
           COALESCE(s.title, '') AS title,
-          snippet(session_fts, 1, '[', ']', '…', 28) AS snippet,
+          {snippet_expr} AS snippet,
           (bm25(session_fts) + ((? - s.updated_at) / 86400.0) * ?) AS score,
           COALESCE(u.pinned, 0) AS pinned,
           COALESCE(u.tags, '') AS tags,
@@ -1271,7 +1280,9 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 base = list_sessions(db_path, limit)
             else:
                 fts = build_prefix_query(q)
-                base = search_sessions(db_path, fts, limit) if fts else list_sessions(db_path, limit)
+                base = (
+                    search_sessions(db_path, fts, limit, include_snippet=False) if fts else list_sessions(db_path, limit)
+                )
             return _apply_filters(base, repo, cwd, tag, pinned_only, group_mode)
         except sqlite3.OperationalError:
             return []

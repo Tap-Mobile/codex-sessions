@@ -200,5 +200,33 @@ class TestQueryInput(unittest.TestCase):
         self.assertTrue(changed)
 
 
+class TestSearchSessions(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_mod()
+
+    def test_search_sessions_can_disable_snippet(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "test.db"
+
+        conn = self.mod.connect_db(db_path)
+        with conn:
+            conn.execute(
+                "INSERT INTO sessions(session_id, created_at, updated_at, cwd, cli_version, file_path, title, preview) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                ("sid-1", 1, 2, "/tmp", "0.0.0", "/tmp/rollout.jsonl", "hello", "preview"),
+            )
+            conn.execute(
+                "INSERT INTO session_fts(session_id, content) VALUES(?, ?)",
+                ("sid-1", "user: hello foo\n\nassistant: bar"),
+            )
+        conn.close()
+
+        rows = self.mod.search_sessions(db_path, "foo*", 10, include_snippet=False)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].session_id, "sid-1")
+        self.assertEqual(rows[0].snippet, "")
+
+
 if __name__ == "__main__":
     unittest.main()
