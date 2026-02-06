@@ -86,15 +86,23 @@ codex-agents stop
 ```
 
 ## Keybindings (live UI)
-- `Enter` resume, `Tab` focus query/list/preview, `Esc` clear
-- `↑/↓` / `PgUp/PgDn` / `Home/End` navigate list (or scroll preview when preview is focused)
-- `←/→` pan preview horizontally (when wrap is off)
-- `n` / `N` next/prev hit in preview
-- `w` toggle preview wrap, `v` toggle preview tail mode
-- `x` pin, `t` tags, `m` note, `g` group
-- `f` repo filter, `d` cwd filter, `F` tag filter, `P` pinned-only
+- Type to search (live, no Enter). `Backspace` deletes; `Ctrl+U` clears.
+- `Enter` resume selected session
+- `Tab` toggle focus `list` / `preview` (`↑/↓` / `PgUp/PgDn` / `Home/End` act on focused pane)
+- `←/→` pan preview horizontally (when wrap is off and preview is focused)
+- `Esc` clears query; if query is empty, exits (also `Ctrl+C` exits)
+
+### Ctrl+X commands
+Press `Ctrl+X` then:
+- `x` pin/unpin
+- `t` tags
+- `m` note
+- `f` repo filter, `d` cwd filter, `F` tag filter
+- `P` pinned-only, `g` group
 - `y` copy id, `c` copy resume cmd, `o` open JSONL in `$EDITOR`
-- `K` fork, `S` share, `R` reindex, `q` quit
+- `K` fork, `S` share, `R` reindex
+- `w` toggle wrap, `v` toggle tail mode
+- `n` / `N` next/prev preview hit
 
 ## Data & privacy
 - Index DB is stored locally (default: `~/.codex-user/codex_sessions.db`)
