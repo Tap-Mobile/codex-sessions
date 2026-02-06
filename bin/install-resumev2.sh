@@ -107,7 +107,8 @@ main() {
 # >>> codex-sessions resumev2 >>>
 export PATH="$HOME/.local/bin:$PATH"
 codex() {
-  if [[ "$1" == "resumev2" ]]; then
+  # Use `${1-}` so this wrapper is safe even with `set -u` (nounset).
+  if [[ "${1-}" == "resumev2" ]]; then
     shift
     local pass=() q=()
     while [[ "$#" -gt 0 ]]; do
@@ -159,7 +160,8 @@ export PATH="$HOME/.local/bin:$PATH"
 # Adds a "virtual" Codex subcommand: `codex resumev2 [query...]`
 # Everything else passes through to the real Codex CLI unchanged.
 codex() {
-  if [[ "$1" == "resumev2" ]]; then
+  # Use `${1-}` so this wrapper is safe even with `set -u` (nounset).
+  if [[ "${1-}" == "resumev2" ]]; then
     shift
     # `codex_sessions.py live` accepts only one positional `query`, so we join
     # extra words while preserving known flags.
@@ -220,4 +222,3 @@ EOF
 }
 
 main "$@"
-
