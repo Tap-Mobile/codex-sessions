@@ -6,6 +6,23 @@ Codex Sessions gives you a fast, local, full‑text “resume picker”: type a 
 
 ## Choose your setup
 
+### Add `codex resumev2` (team-friendly)
+This adds a "virtual" Codex subcommand via a small shell wrapper (zsh/bash):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tap-Mobile/codex-sessions/main/bin/install-resumev2.sh | bash
+```
+
+Then restart your shell (or `source ~/.zshrc` / `source ~/.bashrc`) and run:
+```bash
+codex resumev2
+```
+
+Uninstall:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tap-Mobile/codex-sessions/main/bin/uninstall-resumev2.sh | bash
+```
+
 ### Option 1: Run instantly (recommended)
 ```bash
 npx codex-sessions
