@@ -1545,7 +1545,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
             help_line = (
                 "Type to search. Enter resume. Tab focus list/preview. Arrows/Pg/Home/End: move in focus. "
-                "ESC clear (empty -> quit). Ctrl+X then key: x pin | t tags | m note | f repo | d cwd | F tag | "
+                "ESC clear (empty -> quit). Ctrl+C quit. Ctrl+X then key: x pin | t tags | m note | f repo | d cwd | F tag | "
                 "P pinned | g group | y id | c cmd | o open | S share | K fork | R reindex | w wrap | v tail | n/N hit"
             )
             stdscr.addstr(0, 0, _truncate(help_line, width - 1))
