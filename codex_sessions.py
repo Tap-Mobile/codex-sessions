@@ -691,6 +691,55 @@ def build_prefix_query(user_query: str) -> str:
     return " ".join(out)
 
 
+def _apply_query_key(query: str, cursor: int, k: int, *, allow_cursor_move: bool) -> tuple[str, int, bool, bool]:
+    """Apply a single keypress to the query string.
+
+    Returns: (new_query, new_cursor, handled, changed)
+
+    Notes:
+    - When allow_cursor_move is False, the cursor is treated as "at end" for edit keys,
+      and left/right cursor-move keys are not handled (so they can be used for navigation).
+    - This helper is pure to keep it unit-testable outside curses UI.
+    """
+
+    orig_query = query
+    orig_cursor = cursor
+
+    if not allow_cursor_move:
+        cursor = len(query)
+
+    if allow_cursor_move and k == curses.KEY_LEFT:
+        return query, max(0, cursor - 1), True, False
+    if allow_cursor_move and k == curses.KEY_RIGHT:
+        return query, min(len(query), cursor + 1), True, False
+
+    if k in (curses.KEY_BACKSPACE, 127, 8):
+        if cursor > 0:
+            query = query[: cursor - 1] + query[cursor:]
+            cursor -= 1
+            return query, cursor, True, True
+        return query, cursor, True, False
+
+    if k == curses.KEY_DC:
+        if cursor < len(query):
+            query = query[:cursor] + query[cursor + 1 :]
+            return query, cursor, True, True
+        return query, cursor, True, False
+
+    if k == 21:  # Ctrl-U
+        if query:
+            return "", 0, True, True
+        return "", 0, True, False
+
+    if 32 <= k <= 126:
+        ch = chr(k)
+        query = query[:cursor] + ch + query[cursor:]
+        cursor += 1
+        return query, cursor, True, True
+
+    return orig_query, orig_cursor, False, False
+
+
 def _copy_to_clipboard(text: str) -> bool:
     if sys.platform == "darwin":
         try:
@@ -1266,7 +1315,8 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
         query = initial_query or ""
         cursor = len(query)
-        focus = "query"  # "query" | "list" | "preview"
+        focus = "list"  # "list" | "preview"
+        cmd_prefix = False  # Ctrl-X prefix to run commands without stealing letters from search.
 
         filter_repo = ""
         filter_cwd = ""
@@ -1434,14 +1484,17 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
             list_bottom = height - 2
             list_h = max(1, list_bottom - list_top)
 
-            help_line = "Enter resume | Tab focus q/l/p | / query | arrows/Pg: list or preview | x pin | t tags | m note | f repo | d cwd | F tag | P pinned | g group | n/N hit | w wrap | v tail | y id | c cmd | o open | S share | K fork | R reindex | Esc clear | q quit"
+            help_line = (
+                "Type to search. Enter resume. Tab focus list/preview. Arrows/Pg/Home/End: move in focus. "
+                "ESC clear (empty -> quit). Ctrl+X then key: x pin | t tags | m note | f repo | d cwd | F tag | "
+                "P pinned | g group | y id | c cmd | o open | S share | K fork | R reindex | w wrap | v tail | n/N hit"
+            )
             stdscr.addstr(0, 0, _truncate(help_line, width - 1))
 
-            prompt = f"Query({focus}): "
+            prompt = "Query: "
             stdscr.addstr(1, 0, _truncate(prompt, left_w - 1))
             stdscr.addstr(1, len(prompt), _truncate(query, max(0, left_w - len(prompt) - 1)))
-            if focus == "query":
-                stdscr.move(1, min(len(prompt) + cursor, left_w - 1))
+            stdscr.move(1, min(len(prompt) + cursor, left_w - 1))
 
             # Filters/status line.
             idx_info = f"{idx+1}/{len(rows)}" if rows else "0/0"
@@ -1462,7 +1515,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 indexed_at_h = _fmt_ts(int(indexed_at))
             except Exception:
                 indexed_at_h = "?"
-            status_base = f"{idx_info} | {filt} | indexed {indexed_at_h}"
+            status_base = f"{idx_info} | {filt} | focus {focus} | indexed {indexed_at_h}"
             status = status_base
             if status_msg:
                 status = status + f" | {status_msg}"
@@ -1571,31 +1624,156 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
             k = stdscr.getch()
             status_msg = ""
 
-            if k in (ord("q"),):
-                return None
-            if k in (27,):  # ESC
-                query = ""
-                cursor = 0
-                _refresh_rows(reset_selection=True)
+            sid = _selected_id()
+
+            # Ctrl-X prefix: run commands without stealing letters from type-to-search.
+            if cmd_prefix:
+                cmd_prefix = False
+                if k in (27,):  # ESC cancels.
+                    status_msg = "cmd cancelled"
+                    continue
+
+                if k == ord("y") and sid:
+                    _copy_to_clipboard(sid)
+                    status_msg = "copied id"
+                    continue
+                if k == ord("c") and sid:
+                    _copy_to_clipboard(f"codex resume {sid}")
+                    status_msg = "copied cmd"
+                    continue
+                if k == ord("o") and sid:
+                    fp = (detail or {}).get("file_path", "") if detail else ""
+                    if not fp:
+                        fp = rows[idx].file_path
+                    if fp:
+                        return f"__OPEN__ {fp}"
+                    status_msg = "no file_path"
+                    continue
+                if k == ord("K") and sid:
+                    return f"__FORK__ {sid}"
+                if k == ord("S") and sid:
+                    return f"__SHARE__ {sid}"
+
+                if k == ord("x") and sid:
+                    new_val = 0 if rows[idx].pinned else 1
+                    _set_user_field(sid, "pinned", new_val)
+                    detail_cache.pop(sid, None)
+                    _refresh_rows()
+                    status_msg = "pinned" if new_val else "unpinned"
+                    continue
+                if k == ord("t") and sid:
+                    current_tags = (detail or {}).get("tags", "") if detail else rows[idx].tags
+                    new_tags = _prompt(stdscr, "tags (space/comma separated): ", current_tags)
+                    if new_tags is not None:
+                        _set_user_field(sid, "tags", new_tags)
+                        detail_cache.pop(sid, None)
+                        _refresh_rows()
+                    continue
+                if k == ord("m") and sid:
+                    current_note = (detail or {}).get("note", "") if detail else rows[idx].note
+                    new_note = _prompt(stdscr, "note: ", current_note)
+                    if new_note is not None:
+                        _set_user_field(sid, "note", new_note)
+                        detail_cache.pop(sid, None)
+                    continue
+
+                if k == ord("f"):
+                    filter_repo = _prompt(stdscr, "filter repo (empty clears): ", filter_repo) or ""
+                    _refresh_rows(reset_selection=True)
+                    continue
+                if k == ord("d"):
+                    filter_cwd = _prompt(stdscr, "filter cwd contains (empty clears): ", filter_cwd) or ""
+                    _refresh_rows(reset_selection=True)
+                    continue
+                if k == ord("F"):
+                    filter_tag = _prompt(stdscr, "filter tag contains (empty clears): ", filter_tag) or ""
+                    _refresh_rows(reset_selection=True)
+                    continue
+                if k == ord("P"):
+                    pinned_only = not pinned_only
+                    _refresh_rows(reset_selection=True)
+                    continue
+                if k == ord("g"):
+                    group_mode = not group_mode
+                    _refresh_rows(reset_selection=True)
+                    continue
+
+                if k == ord("R"):
+                    # Force reindex.
+                    index_sessions(db_path, Path(os.path.expanduser("~")) / ".codex", force=True)
+                    detail_cache.clear()
+                    _refresh_rows(reset_selection=True)
+                    status_msg = "reindexed"
+                    continue
+
+                if k == ord("w"):
+                    preview_wrap = not preview_wrap
+                    if preview_wrap:
+                        preview_x_offset = 0
+                    if detail:
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == ord("v"):
+                    preview_tail = not preview_tail
+                    if preview_tail and detail and not preview_cached_terms:
+                        preview_y_offset = max(0, len(preview_render_lines) - int(preview_h))
+                    continue
+                if k == ord("n"):
+                    if detail and preview_matches_render:
+                        preview_match_idx = (int(preview_match_idx) + 1) % len(preview_matches_render)
+                        preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+                if k == ord("N"):
+                    if detail and preview_matches_render:
+                        preview_match_idx = (int(preview_match_idx) - 1) % len(preview_matches_render)
+                        preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
+                        _preview_ensure(detail, preview_w, preview_h)
+                    continue
+
+                status_msg = "unknown cmd"
                 continue
+
+            if k == 24:  # Ctrl-X
+                cmd_prefix = True
+                status_msg = "cmd: waiting key"
+                continue
+
+            if k in (curses.KEY_ENTER, 10, 13):
+                if sid:
+                    return f"__RESUME__ {sid}"
+                continue
+
             if k in (9,):  # TAB
-                if focus == "query":
-                    focus = "list"
-                elif focus == "list":
-                    focus = "preview"
-                else:
-                    focus = "query"
+                focus = "preview" if focus == "list" else "list"
                 continue
-            if k in (ord("/"),):
-                focus = "query"
+
+            if k in (3,):  # Ctrl-C
+                return None
+
+            if k in (27,):  # ESC: clear query, or quit if already empty.
+                if query:
+                    query = ""
+                    cursor = 0
+                    _refresh_rows(reset_selection=True)
+                    continue
+                return None
+
+            # Type-to-search: always edit query; never require Enter.
+            query2, cursor2, handled, changed = _apply_query_key(query, cursor, k, allow_cursor_move=False)
+            if handled:
+                query = query2
+                cursor = cursor2
+                if changed:
+                    _refresh_rows(reset_selection=True)
                 continue
 
             # Preview navigation only when focused.
             if focus == "preview" and detail:
-                if k in (curses.KEY_UP, ord("k"), 16):  # Ctrl-P
+                if k in (curses.KEY_UP, 16):  # Ctrl-P
                     preview_y_offset = max(0, int(preview_y_offset) - 1)
                     continue
-                if k in (curses.KEY_DOWN, ord("j"), 14):  # Ctrl-N
+                if k in (curses.KEY_DOWN, 14):  # Ctrl-N
                     preview_y_offset = int(preview_y_offset) + 1
                     _preview_ensure(detail, preview_w, preview_h)
                     continue
@@ -1622,48 +1800,15 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                         preview_x_offset = int(preview_x_offset) + 1
                         _preview_ensure(detail, preview_w, preview_h)
                     continue
-                if k == ord("w"):
-                    preview_wrap = not preview_wrap
-                    if preview_wrap:
-                        preview_x_offset = 0
-                    _preview_ensure(detail, preview_w, preview_h)
-                    continue
-                if k == ord("n"):
-                    if preview_matches_render:
-                        preview_match_idx = (int(preview_match_idx) + 1) % len(preview_matches_render)
-                        preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
-                        _preview_ensure(detail, preview_w, preview_h)
-                    continue
-                if k == ord("N"):
-                    if preview_matches_render:
-                        preview_match_idx = (int(preview_match_idx) - 1) % len(preview_matches_render)
-                        preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
-                        _preview_ensure(detail, preview_w, preview_h)
-                    continue
-                if k == ord("v"):
-                    preview_tail = not preview_tail
-                    if preview_tail and not preview_cached_terms:
-                        preview_y_offset = max(0, len(preview_render_lines) - int(preview_h))
-                    continue
 
-            # List navigation (arrow keys always; vim/Ctrl keys only when not typing).
-            if focus != "preview":
-                if k in (curses.KEY_UP,):
+            # List navigation (only when list is focused).
+            if focus == "list":
+                if k in (curses.KEY_UP, 16):  # Ctrl-P
                     if rows:
                         idx = max(0, idx - 1)
                         _clamp()
                     continue
-                if k in (curses.KEY_DOWN,):
-                    if rows:
-                        idx = min(len(rows) - 1, idx + 1)
-                        _clamp()
-                    continue
-                if focus != "query" and k in (ord("k"), 16):  # Ctrl-P
-                    if rows:
-                        idx = max(0, idx - 1)
-                        _clamp()
-                    continue
-                if focus != "query" and k in (ord("j"), 14):  # Ctrl-N
+                if k in (curses.KEY_DOWN, 14):  # Ctrl-N
                     if rows:
                         idx = min(len(rows) - 1, idx + 1)
                         _clamp()
@@ -1686,141 +1831,6 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                     idx = len(rows) - 1
                     _clamp()
                     continue
-
-            sid = _selected_id()
-            if k in (curses.KEY_ENTER, 10, 13):
-                if sid:
-                    return f"__RESUME__ {sid}"
-                continue
-
-            # Query edit/typing takes precedence over action hotkeys.
-            if focus == "query":
-                if k in (curses.KEY_LEFT,):
-                    cursor = max(0, cursor - 1)
-                    continue
-                if k in (curses.KEY_RIGHT,):
-                    cursor = min(len(query), cursor + 1)
-                    continue
-                if k in (curses.KEY_BACKSPACE, 127, 8):
-                    if cursor > 0:
-                        query = query[: cursor - 1] + query[cursor:]
-                        cursor -= 1
-                        _refresh_rows(reset_selection=True)
-                    continue
-                if k == curses.KEY_DC:
-                    if cursor < len(query):
-                        query = query[:cursor] + query[cursor + 1 :]
-                        _refresh_rows(reset_selection=True)
-                    continue
-                if k in (21,):  # Ctrl-U
-                    query = ""
-                    cursor = 0
-                    _refresh_rows(reset_selection=True)
-                    continue
-                if 32 <= k <= 126:
-                    ch = chr(k)
-                    query = query[:cursor] + ch + query[cursor:]
-                    cursor += 1
-                    _refresh_rows(reset_selection=True)
-                    continue
-                continue
-
-            # From here down: focus is list/preview, so action hotkeys are active.
-            if k == ord("y") and sid:
-                _copy_to_clipboard(sid)
-                status_msg = "copied id"
-                continue
-            if k == ord("c") and sid:
-                _copy_to_clipboard(f"codex resume {sid}")
-                status_msg = "copied cmd"
-                continue
-            if k == ord("o") and sid:
-                fp = (detail or {}).get("file_path", "") if detail else ""
-                if not fp:
-                    fp = rows[idx].file_path
-                if fp:
-                    return f"__OPEN__ {fp}"
-                status_msg = "no file_path"
-                continue
-
-            if k == ord("K") and sid:
-                return f"__FORK__ {sid}"
-
-            if k == ord("S") and sid:
-                return f"__SHARE__ {sid}"
-
-            if k == ord("x") and sid:
-                new_val = 0 if rows[idx].pinned else 1
-                _set_user_field(sid, "pinned", new_val)
-                if sid in detail_cache:
-                    detail_cache.pop(sid, None)
-                _refresh_rows()
-                status_msg = "pinned" if new_val else "unpinned"
-                continue
-            if k == ord("t") and sid:
-                current_tags = (detail or {}).get("tags", "") if detail else rows[idx].tags
-                new_tags = _prompt(stdscr, "tags (space/comma separated): ", current_tags)
-                if new_tags is not None:
-                    _set_user_field(sid, "tags", new_tags)
-                    detail_cache.pop(sid, None)
-                    _refresh_rows()
-                continue
-            if k == ord("m") and sid:
-                current_note = (detail or {}).get("note", "") if detail else rows[idx].note
-                new_note = _prompt(stdscr, "note: ", current_note)
-                if new_note is not None:
-                    _set_user_field(sid, "note", new_note)
-                    detail_cache.pop(sid, None)
-                continue
-
-            if k == ord("f"):
-                filter_repo = _prompt(stdscr, "filter repo (empty clears): ", filter_repo) or ""
-                _refresh_rows(reset_selection=True)
-                continue
-            if k == ord("d"):
-                filter_cwd = _prompt(stdscr, "filter cwd contains (empty clears): ", filter_cwd) or ""
-                _refresh_rows(reset_selection=True)
-                continue
-            if k == ord("F"):
-                filter_tag = _prompt(stdscr, "filter tag contains (empty clears): ", filter_tag) or ""
-                _refresh_rows(reset_selection=True)
-                continue
-            if k == ord("P"):
-                pinned_only = not pinned_only
-                _refresh_rows(reset_selection=True)
-                continue
-            if k == ord("g"):
-                group_mode = not group_mode
-                _refresh_rows(reset_selection=True)
-                continue
-
-            if k == ord("R"):
-                # Force reindex.
-                index_sessions(db_path, Path(os.path.expanduser("~")) / ".codex", force=True)
-                detail_cache.clear()
-                _refresh_rows(reset_selection=True)
-                status_msg = "reindexed"
-                continue
-            if k == ord("v"):
-                preview_tail = not preview_tail
-                if preview_tail and detail and not preview_cached_terms:
-                    preview_y_offset = max(0, len(preview_render_lines) - int(preview_h))
-                continue
-
-            if k == ord("n"):
-                if detail and preview_matches_render:
-                    preview_match_idx = (int(preview_match_idx) + 1) % len(preview_matches_render)
-                    preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
-                    _preview_ensure(detail, preview_w, preview_h)
-                continue
-            if k == ord("N"):
-                if detail and preview_matches_render:
-                    preview_match_idx = (int(preview_match_idx) - 1) % len(preview_matches_render)
-                    preview_y_offset = max(0, int(preview_matches_render[preview_match_idx]) - 2)
-                    _preview_ensure(detail, preview_w, preview_h)
-                continue
-
-            # When focus=list/preview, ignore typing.
 
     selected = curses.wrapper(_ui)
     conn.close()

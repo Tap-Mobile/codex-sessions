@@ -161,5 +161,44 @@ class TestPreviewHelpers(unittest.TestCase):
         self.assertEqual(matches[0][0], 1)  # line with both terms
 
 
+class TestQueryInput(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_mod()
+
+    def test_apply_query_key_appends_when_not_allow_cursor_move(self):
+        q, cur, handled, changed = self.mod._apply_query_key("ab", 0, ord("c"), allow_cursor_move=False)
+        self.assertEqual(q, "abc")
+        self.assertEqual(cur, 3)
+        self.assertTrue(handled)
+        self.assertTrue(changed)
+
+    def test_apply_query_key_backspace_deletes_from_end_when_not_allow_cursor_move(self):
+        q, cur, handled, changed = self.mod._apply_query_key("abc", 0, 127, allow_cursor_move=False)
+        self.assertEqual(q, "ab")
+        self.assertEqual(cur, 2)
+        self.assertTrue(handled)
+        self.assertTrue(changed)
+
+    def test_apply_query_key_left_not_handled_when_not_allow_cursor_move(self):
+        q, cur, handled, changed = self.mod._apply_query_key(
+            "abc", 1, self.mod.curses.KEY_LEFT, allow_cursor_move=False
+        )
+        self.assertEqual((q, cur), ("abc", 1))
+        self.assertFalse(handled)
+        self.assertFalse(changed)
+
+    def test_apply_query_key_left_moves_cursor_when_allow_cursor_move(self):
+        q, cur, handled, changed = self.mod._apply_query_key("abc", 2, self.mod.curses.KEY_LEFT, allow_cursor_move=True)
+        self.assertEqual((q, cur), ("abc", 1))
+        self.assertTrue(handled)
+        self.assertFalse(changed)
+
+    def test_apply_query_key_ctrl_u_clears(self):
+        q, cur, handled, changed = self.mod._apply_query_key("abc", 3, 21, allow_cursor_move=False)
+        self.assertEqual((q, cur), ("", 0))
+        self.assertTrue(handled)
+        self.assertTrue(changed)
+
+
 if __name__ == "__main__":
     unittest.main()
