@@ -228,5 +228,27 @@ class TestSearchSessions(unittest.TestCase):
         self.assertEqual(rows[0].snippet, "")
 
 
+class TestDebounce(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_mod()
+
+    def test_debounce_due_after_delay(self):
+        d = self.mod._Debounce(0.1)
+        d.mark(0.0)
+        self.assertTrue(d.pending)
+        self.assertFalse(d.due(0.05))
+        self.assertTrue(d.due(0.11))
+        d.clear()
+        self.assertFalse(d.pending)
+        self.assertFalse(d.due(1.0))
+
+    def test_debounce_resets_when_marked_again(self):
+        d = self.mod._Debounce(0.1)
+        d.mark(0.0)
+        d.mark(0.06)
+        self.assertFalse(d.due(0.15))
+        self.assertTrue(d.due(0.17))
+
+
 if __name__ == "__main__":
     unittest.main()

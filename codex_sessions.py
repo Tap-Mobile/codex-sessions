@@ -700,6 +700,30 @@ def build_prefix_query(user_query: str) -> str:
     return " ".join(out)
 
 
+@dataclass
+class _Debounce:
+    """Small helper to debounce expensive work in the curses UI.
+
+    This stays pure/time-source-agnostic so unit tests can pass explicit timestamps.
+    """
+
+    delay_s: float
+    pending: bool = False
+    _last_mark: float = 0.0
+
+    def mark(self, now: float) -> None:
+        self.pending = True
+        self._last_mark = float(now)
+
+    def due(self, now: float) -> bool:
+        if not self.pending:
+            return False
+        return (float(now) - float(self._last_mark)) >= float(self.delay_s)
+
+    def clear(self) -> None:
+        self.pending = False
+
+
 def _apply_query_key(query: str, cursor: int, k: int, *, allow_cursor_move: bool) -> tuple[str, int, bool, bool]:
     """Apply a single keypress to the query string.
 
@@ -1154,6 +1178,8 @@ def _run_curses_picker(rows: list[SearchRow], auto_copy: bool) -> Optional[str]:
 
             stdscr.refresh()
             k = stdscr.getch()
+            if k in (3,):  # Ctrl-C
+                return None
             if k in (ord("q"), 27):
                 return None
             if k in (curses.KEY_UP, ord("k")):
@@ -1169,7 +1195,10 @@ def _run_curses_picker(rows: list[SearchRow], auto_copy: bool) -> Optional[str]:
             elif k in (ord("r"),):
                 return f"codex resume {rows[idx].session_id}"
 
-    selected = curses.wrapper(_ui)
+    try:
+        selected = curses.wrapper(_ui)
+    except KeyboardInterrupt:
+        selected = None
     if selected and auto_copy:
         if selected.startswith("__RESUME__ "):
             pass
@@ -1321,13 +1350,16 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
     def _ui(stdscr) -> Optional[str]:
         curses.curs_set(1)
-        stdscr.nodelay(False)
+        # Poll so we can debounce expensive FTS queries while still updating the UI immediately.
+        stdscr.timeout(80)
         stdscr.keypad(True)
 
         query = initial_query or ""
         cursor = len(query)
         focus = "list"  # "list" | "preview"
         cmd_prefix = False  # Ctrl-X prefix to run commands without stealing letters from search.
+        refresh_debounce = _Debounce(0.15)
+        refresh_reset_selection = False
 
         filter_repo = ""
         filter_cwd = ""
@@ -1374,10 +1406,26 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 offset = 0
             _clamp()
 
+        def _flush_pending_refresh() -> None:
+            nonlocal refresh_reset_selection
+            if not refresh_debounce.pending:
+                return
+            _refresh_rows(reset_selection=refresh_reset_selection)
+            refresh_reset_selection = False
+            refresh_debounce.clear()
+
         def _selected_id() -> str:
             if not rows:
                 return ""
             return rows[idx].session_id
+
+        def _selected_detail() -> dict:
+            sid = _selected_id()
+            if not sid:
+                return {}
+            if sid not in detail_cache:
+                detail_cache[sid] = _get_detail(sid)
+            return detail_cache.get(sid) or {}
 
         def _query_terms() -> tuple[str, ...]:
             # Keep it simple and predictable: extract "word" tokens.
@@ -1527,6 +1575,8 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
             except Exception:
                 indexed_at_h = "?"
             status_base = f"{idx_info} | {filt} | focus {focus} | indexed {indexed_at_h}"
+            if refresh_debounce.pending:
+                status_base = status_base + " | search pending"
             status = status_base
             if status_msg:
                 status = status + f" | {status_msg}"
@@ -1561,11 +1611,7 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
             # Right preview.
             sid = _selected_id()
-            detail = {}
-            if sid:
-                if sid not in detail_cache:
-                    detail_cache[sid] = _get_detail(sid)
-                detail = detail_cache.get(sid) or {}
+            detail = _selected_detail()
 
             rx = left_w + 1
             preview_w = max(1, right_w - 1)
@@ -1633,9 +1679,16 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
 
             stdscr.refresh()
             k = stdscr.getch()
-            status_msg = ""
+            now_mono = time.monotonic()
 
-            sid = _selected_id()
+            # Tick: no keypress. Used to drive debounced refresh without requiring an extra key.
+            if k == -1:
+                if refresh_debounce.due(now_mono):
+                    _flush_pending_refresh()
+                continue
+
+            # Clear any previous status once we receive a real keypress.
+            status_msg = ""
 
             # Ctrl-X prefix: run commands without stealing letters from type-to-search.
             if cmd_prefix:
@@ -1643,6 +1696,12 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 if k in (27,):  # ESC cancels.
                     status_msg = "cmd cancelled"
                     continue
+
+                if refresh_debounce.pending:
+                    _flush_pending_refresh()
+
+                sid = _selected_id()
+                detail = _selected_detail()
 
                 if k == ord("y") and sid:
                     _copy_to_clipboard(sid)
@@ -1746,17 +1805,10 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 continue
 
             if k == 24:  # Ctrl-X
+                if refresh_debounce.pending:
+                    _flush_pending_refresh()
                 cmd_prefix = True
                 status_msg = "cmd: waiting key"
-                continue
-
-            if k in (curses.KEY_ENTER, 10, 13):
-                if sid:
-                    return f"__RESUME__ {sid}"
-                continue
-
-            if k in (9,):  # TAB
-                focus = "preview" if focus == "list" else "list"
                 continue
 
             if k in (3,):  # Ctrl-C
@@ -1767,6 +1819,9 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                     query = ""
                     cursor = 0
                     _refresh_rows(reset_selection=True)
+                    refresh_reset_selection = False
+                    refresh_debounce.clear()
+                    status_msg = "cleared (ESC to quit)"
                     continue
                 return None
 
@@ -1776,7 +1831,25 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                 query = query2
                 cursor = cursor2
                 if changed:
-                    _refresh_rows(reset_selection=True)
+                    if not query.strip() or query.strip() == "*":
+                        _refresh_rows(reset_selection=True)
+                        refresh_reset_selection = False
+                        refresh_debounce.clear()
+                    else:
+                        refresh_reset_selection = True
+                        refresh_debounce.mark(now_mono)
+                continue
+
+            if k in (curses.KEY_ENTER, 10, 13):
+                if refresh_debounce.pending:
+                    _flush_pending_refresh()
+                sid = _selected_id()
+                if sid:
+                    return f"__RESUME__ {sid}"
+                continue
+
+            if k in (9,):  # TAB
+                focus = "preview" if focus == "list" else "list"
                 continue
 
             # Preview navigation only when focused.
@@ -1843,7 +1916,10 @@ def _run_curses_live(db_path: Path, limit: int, initial_query: str, auto_copy: b
                     _clamp()
                     continue
 
-    selected = curses.wrapper(_ui)
+    try:
+        selected = curses.wrapper(_ui)
+    except KeyboardInterrupt:
+        selected = None
     conn.close()
     if selected and auto_copy:
         if selected.startswith("__RESUME__ "):
